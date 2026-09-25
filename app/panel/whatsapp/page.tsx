@@ -6,6 +6,7 @@ import { Submit } from "@/components/Submit";
 import { disconnectWhatsapp, sendTestMessage, reconfigureWebhook } from "../actions";
 import { isPublicHttps, publicAppUrl, type Step } from "@/lib/metaConnect";
 import { ConnectForm } from "./ConnectForm";
+import "./setup.css";
 
 export const metadata = { title: "WhatsApp" };
 
