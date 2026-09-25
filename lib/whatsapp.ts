@@ -3,7 +3,8 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { db } from "./supabase";
 
 export const GRAPH_VERSION = process.env.API_VERSION || "v22.0";
-const GRAPH = `https://graph.facebook.com/${GRAPH_VERSION}`;
+// META_GRAPH_URL solo se usa en pruebas locales (Meta simulado); en producción es graph.facebook.com
+export const GRAPH = `${(process.env.META_GRAPH_URL || "https://graph.facebook.com").replace(/\/$/, "")}/${GRAPH_VERSION}`;
 
 export type WaAccount = {
   id?: string;
@@ -12,6 +13,8 @@ export type WaAccount = {
   waba_id: string;
   access_token: string;
   display_phone?: string | null;
+  app_id?: string | null;
+  app_secret?: string | null;
 };
 
 /* ── Límites oficiales de mensajes interactivos ─────────────────────── */
@@ -106,7 +109,7 @@ export function describePayload(p: any): string {
   return p.type;
 }
 
-/* ── Envío ────────────────────────────────────────────────────────── */
+/* ── Envío ──────────────────────────────────────────────────────────── */
 export async function sendWa(
   acc: WaAccount,
   to: string,
@@ -164,17 +167,22 @@ export async function markReadTyping(acc: WaAccount, messageId: string) {
 }
 
 /* ── Seguridad del webhook ──────────────────────────────────────────── */
-export function verifySignature(raw: string, header: string | null): boolean {
-  const secret = process.env.META_APP_SECRET;
-  if (!secret) return true; // sin secreto configurado no se puede validar (solo desarrollo)
+/** Valida X-Hub-Signature-256 contra una lista de App Secrets candidatos.
+ *  Cada consultorio conecta su propia app de Meta, por lo que el webhook acepta la firma
+ *  del App Secret del consultorio dueño del número (o el de la plataforma). */
+export function verifySignature(raw: string, header: string | null, secrets: (string | null | undefined)[] = [process.env.META_APP_SECRET]): boolean {
+  const list = [...new Set(secrets.filter((s): s is string => !!s))];
+  if (!list.length) return process.env.NODE_ENV !== "production"; // sin secretos: solo se tolera en desarrollo
   if (!header?.startsWith("sha256=")) return false;
-  const expected = createHmac("sha256", secret).update(raw, "utf8").digest("hex");
   const got = header.slice(7);
-  if (got.length !== expected.length) return false;
-  return timingSafeEqual(Buffer.from(got, "hex"), Buffer.from(expected, "hex"));
+  if (!/^[0-9a-f]{64}$/i.test(got)) return false;
+  return list.some((secret) => {
+    const expected = createHmac("sha256", secret).update(raw, "utf8").digest("hex");
+    return timingSafeEqual(Buffer.from(got, "hex"), Buffer.from(expected, "hex"));
+  });
 }
 
-/* ── Gestión de la cuenta (formulario de conexión) ────────────────── */
+/* ── Gestión de la cuenta (formulario de conexión) ──────────────────── */
 export async function fetchPhoneInfo(phoneNumberId: string, token: string) {
   const r = await fetch(
     `${GRAPH}/${phoneNumberId}?fields=display_phone_number,verified_name,quality_rating,code_verification_status,name_status`,
@@ -211,7 +219,15 @@ export async function getAccountByPhoneId(phoneNumberId: string) {
   return data as (WaAccount & { id: string }) | null;
 }
 
+export async function getAccountsByPhoneIds(ids: string[]) {
+  if (!ids.length) return [];
+  const { data } = await db().from("whatsapp_accounts").select("*").in("phone_number_id", ids);
+  return (data ?? []) as (WaAccount & { id: string })[];
+}
+
 export async function getAccountByClinic(clinicId: string) {
   const { data } = await db().from("whatsapp_accounts").select("*").eq("clinic_id", clinicId).maybeSingle();
-  return data as (WaAccount & { id: string; display_phone: string; verified_name: string; status: string; last_error: string; quality_rating: string }) | null;
+  return data as (WaAccount & { id: string; display_phone: string; verified_name: string; status: string; last_error: string; quality_rating: string;
+    webhook_status: string; webhook_url: string | null; webhook_verified_at: string | null; webhook_last_event_at: string | null;
+    token_expires_at: string | null; setup_report: any; setup_at: string | null; webhook_verify_token: string | null }) | null;
 }
