@@ -4,7 +4,8 @@ import { db, authClient } from "@/lib/supabase";
 import { requireAdmin, requireContext } from "@/lib/session";
 import { bookAppointment, normalizePhone, setAppointmentStatus, upsertPatient } from "@/lib/booking";
 import { zonedToUtc } from "@/lib/time.ts";
-import { fetchPhoneInfo, subscribeApp, getAccountByClinic, sendWa, wa } from "@/lib/whatsapp";
+import { getAccountByClinic, sendWa, wa } from "@/lib/whatsapp";
+import { runSetup, removeOverride, type Step } from "@/lib/metaConnect";
 import { sendRemindersForClinic } from "@/lib/bot";
 import { igProfile } from "@/lib/instagram";
 
@@ -335,57 +336,65 @@ export async function saveBot(_: S, fd: FormData): Promise<S> {
 }
 
 /* ═══════════════════════ WHATSAPP ═══════════════════════ */
+const summarize = (steps: Step[]) => steps.filter((x) => x.state === "warn").map((x) => x.detail).join(" ");
+
 export async function connectWhatsapp(_: S, fd: FormData): Promise<S> {
   try {
     const { clinic } = await requireAdmin();
     const useDemo = fd.get("use_demo") === "on";
-    const phoneNumberId = useDemo ? process.env.BUSINESS_PHONE || "" : str(fd, "phone_number_id");
-    const wabaId = useDemo ? process.env.WABA_ID || "" : str(fd, "waba_id");
-    let token = useDemo ? process.env.WHATSAPP_ACCESS_TOKEN || "" : str(fd, "access_token");
-    if (!token) {
-      const existing = await getAccountByClinic(clinic.id);
-      if (existing && existing.phone_number_id === phoneNumberId) token = existing.access_token;
+    const env = process.env;
+    const phoneNumberId = useDemo ? env.BUSINESS_PHONE || "" : str(fd, "phone_number_id");
+    const wabaId = useDemo ? env.WABA_ID || "" : str(fd, "waba_id");
+    let token = useDemo ? env.WHATSAPP_ACCESS_TOKEN || "" : str(fd, "access_token");
+    const appId = useDemo ? env.META_APP_ID || "" : str(fd, "app_id");
+    let appSecret = useDemo ? env.META_APP_SECRET || "" : str(fd, "app_secret");
+
+    // Campos secretos vacíos = mantener los guardados (si es el mismo número)
+    const existing = await getAccountByClinic(clinic.id);
+    if (existing && existing.phone_number_id === phoneNumberId) {
+      if (!token) token = existing.access_token;
+      if (!appSecret && existing.app_id === appId) appSecret = existing.app_secret || "";
     }
-    if (!/^\d{6,}$/.test(phoneNumberId)) return { error: "El Phone Number ID debe ser numérico (lo ves en Meta → WhatsApp → Configuración de la API)." };
+    if (useDemo && (!phoneNumberId || !wabaId || !token || !appId || !appSecret))
+      return { error: "Faltan variables del número de ejemplo en el servidor (BUSINESS_PHONE, WABA_ID, WHATSAPP_ACCESS_TOKEN, META_APP_ID, META_APP_SECRET)." };
+    if (!/^\d{6,}$/.test(phoneNumberId)) return { error: "El Phone Number ID debe ser numérico (Meta → WhatsApp → Configuración de la API)." };
     if (!/^\d{6,}$/.test(wabaId)) return { error: "El WhatsApp Business Account ID debe ser numérico." };
+    if (!/^\d{6,}$/.test(appId)) return { error: "El App ID debe ser numérico (Meta for Developers → tu app → Configuración de la app → Básica)." };
+    if (!/^[0-9a-f]{32}$/i.test(appSecret)) return { error: "El App Secret debe tener 32 caracteres (Configuración de la app → Básica → Clave secreta de la app → Mostrar)." };
     if (!token) return { error: "Falta el token de acceso." };
 
     const { data: other } = await db().from("whatsapp_accounts").select("clinic_id").eq("phone_number_id", phoneNumberId).maybeSingle();
     if (other && other.clinic_id !== clinic.id) return { error: "Ese número ya está conectado a otro consultorio en Molara." };
 
-    // 1) Validar credenciales contra Meta
-    let info;
-    try {
-      info = await fetchPhoneInfo(phoneNumberId, token);
-    } catch (e: any) {
-      return { error: `Meta rechazó las credenciales: ${e.message}` };
-    }
-    // 2) Suscribir la app a la WABA para recibir mensajes en el webhook
-    let subErr: string | null = null;
-    try {
-      await subscribeApp(wabaId, token);
-    } catch (e: any) {
-      subErr = e.message;
-    }
-
-    const row = {
-      clinic_id: clinic.id,
-      phone_number_id: phoneNumberId,
-      waba_id: wabaId,
-      access_token: token,
-      display_phone: info.display_phone_number,
-      verified_name: info.verified_name,
-      quality_rating: info.quality_rating ?? null,
-      status: "connected",
-      last_error: subErr,
-      updated_at: new Date().toISOString(),
-    };
-    const { error } = await db().from("whatsapp_accounts").upsert(row, { onConflict: "clinic_id" });
-    if (error) return { error: error.message };
+    const r = await runSetup(clinic.id, { phoneNumberId, wabaId, token, appId, appSecret });
     revalidatePath("/panel", "layout");
-    return {
-      ok: `Conectado: ${info.verified_name} (${info.display_phone_number}).${subErr ? ` Aviso: no se pudo suscribir la app a la WABA (${subErr}).` : " Webhook suscrito ✔"}`,
-    };
+    if (!r.ok) return { error: r.error };
+    const who = `${r.info.verified_name} (${r.info.display_phone_number})`;
+    if (r.status === "active") {
+      const w = summarize(r.steps);
+      return { ok: `¡Listo! ${who} quedó conectado y Molara configuró el webhook en Meta automáticamente ✔${w ? ` Aviso: ${w}` : ""}` };
+    }
+    if (r.status === "pending") return { ok: `${who} quedó conectado ✔ El webhook se activará automáticamente al publicar la plataforma en internet.` };
+    return { error: `${who} quedó guardado, pero Meta no aceptó el webhook: ${r.error} Puedes reintentar con “Reconfigurar webhook”.` };
+  } catch (e) {
+    return fail(e);
+  }
+}
+
+/** Vuelve a ejecutar la conexión automática con las credenciales guardadas. */
+export async function reconfigureWebhook(_: S, fd: FormData): Promise<S> {
+  void fd;
+  try {
+    const { clinic } = await requireAdmin();
+    const acc = await getAccountByClinic(clinic.id);
+    if (!acc) return { error: "Conecta primero tu número." };
+    if (!acc.app_id || !acc.app_secret) return { error: "Faltan el App ID y el App Secret. Complétalos en el formulario y presiona “Actualizar y verificar”." };
+    const r = await runSetup(clinic.id, { phoneNumberId: acc.phone_number_id, wabaId: acc.waba_id, token: acc.access_token, appId: acc.app_id, appSecret: acc.app_secret });
+    revalidatePath("/panel", "layout");
+    if (!r.ok) return { error: r.error };
+    if (r.status === "active") return { ok: "Webhook verificado y activo en Meta ✔" };
+    if (r.status === "pending") return { ok: "Credenciales correctas. El webhook se activará al publicar la plataforma en internet." };
+    return { error: r.error || "Meta no aceptó el webhook." };
   } catch (e) {
     return fail(e);
   }
@@ -394,6 +403,10 @@ export async function connectWhatsapp(_: S, fd: FormData): Promise<S> {
 export async function disconnectWhatsapp(fd: FormData) {
   const { clinic } = await requireAdmin();
   void fd;
+  const acc = await getAccountByClinic(clinic.id);
+  if (acc) {
+    try { await removeOverride(acc.waba_id, acc.access_token); } catch {}
+  }
   await db().from("whatsapp_accounts").delete().eq("clinic_id", clinic.id);
   revalidatePath("/panel", "layout");
 }
