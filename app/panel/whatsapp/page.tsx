@@ -1,19 +1,26 @@
 import { requireContext } from "@/lib/session";
 import { getAccountByClinic, listTemplates } from "@/lib/whatsapp";
 import { Icon } from "@/components/Icon";
-import { ActionForm, CopyButton, ConfirmSubmit } from "@/components/ActionForm";
+import { ActionForm, ConfirmSubmit } from "@/components/ActionForm";
 import { Submit } from "@/components/Submit";
-import { disconnectWhatsapp, sendTestMessage } from "../actions";
+import { disconnectWhatsapp, sendTestMessage, reconfigureWebhook } from "../actions";
+import { isPublicHttps, publicAppUrl, type Step } from "@/lib/metaConnect";
 import { ConnectForm } from "./ConnectForm";
+import "./setup.css";
 
 export const metadata = { title: "WhatsApp" };
 
 export default async function WhatsappPage() {
   const { clinic, role } = await requireContext();
   const acc = await getAccountByClinic(clinic.id);
-  const appUrl = (process.env.NEXT_PUBLIC_APP_URL || "").replace(/\/$/, "");
-  const webhook = `${appUrl}/api/whatsapp/webhook`;
-  const demo = process.env.BUSINESS_PHONE && process.env.WABA_ID && process.env.WHATSAPP_ACCESS_TOKEN ? { phone: process.env.BUSINESS_PHONE, waba: process.env.WABA_ID } : null;
+  const appUrl = publicAppUrl();
+  const isPublic = isPublicHttps(appUrl);
+  const env = process.env;
+  const demo = env.BUSINESS_PHONE && env.WABA_ID && env.WHATSAPP_ACCESS_TOKEN && env.META_APP_ID && env.META_APP_SECRET ? { phone: env.BUSINESS_PHONE, waba: env.WABA_ID } : null;
+  const steps: Step[] = acc?.setup_report?.steps ?? [];
+  const wh = acc?.webhook_status ?? "pending";
+  const whBadge = wh === "active" ? ["b-confirmed", "Webhook activo"] : wh === "error" ? ["b-cancelled", "Webhook con error"] : ["b-pending", "Webhook pendiente"];
+  const fmt = (d?: string | null) => (d ? new Intl.DateTimeFormat("es-CL", { dateStyle: "medium", timeStyle: "short", timeZone: clinic.timezone }).format(new Date(d)) : "—");
 
   let templates: any[] = [];
   let tplError = "";
@@ -32,9 +39,8 @@ export default async function WhatsappPage() {
           <div className="row">
             <span className="kpi" style={{ padding: 0 }}><span className="ic" style={{ width: 48, height: 48, borderRadius: 14, background: "var(--wa)", color: "#fff", display: "grid", placeItems: "center" }}><Icon name="whatsapp" size={26} /></span></span>
             <div>
-              <div className="row"><b style={{ fontSize: 18 }}>{acc.verified_name}</b><span className="badge b-confirmed">Conectado</span>{acc.quality_rating && <span className="badge plain">Calidad: {acc.quality_rating}</span>}</div>
+              <div className="row"><b style={{ fontSize: 18 }}>{acc.verified_name}</b><span className="badge b-confirmed">Conectado</span><span className={`badge ${whBadge[0]}`}>{whBadge[1]}</span>{acc.quality_rating && <span className="badge plain">Calidad: {acc.quality_rating}</span>}</div>
               <div className="muted small">{acc.display_phone} · Phone ID <span className="mono">{acc.phone_number_id}</span></div>
-              {acc.last_error && <div className="tiny" style={{ color: "#9a5b00" }}>⚠ {acc.last_error}</div>}
             </div>
           </div>
           <div className="row">
@@ -52,24 +58,65 @@ export default async function WhatsappPage() {
         <div className="card">
           <div className="card-head"><h3>{acc ? "Credenciales del número" : "Registrar mi número"}</h3></div>
           <div className="card-pad">
-            {role === "staff" ? <p className="muted small">Solo administradores pueden cambiar la conexión.</p> : <ConnectForm current={acc ? { phone_number_id: acc.phone_number_id, waba_id: acc.waba_id } : null} demo={demo} />}
+            {role === "staff" ? <p className="muted small">Solo administradores pueden cambiar la conexión.</p> : <ConnectForm current={acc ? { phone_number_id: acc.phone_number_id, waba_id: acc.waba_id, app_id: acc.app_id ?? null, has_secret: !!acc.app_secret } : null} demo={demo} />}
           </div>
         </div>
 
-        <div className="card">
-          <div className="card-head"><h3>Pasos en Meta</h3></div>
-          <div className="card-pad stack-sm small">
-            <ol style={{ margin: 0, paddingLeft: 18, display: "grid", gap: 10 }}>
-              <li>Entra a <a href="https://business.facebook.com/wa/manage/home/" target="_blank" style={{ color: "var(--teal)" }}>WhatsApp Manager</a> y agrega tu número (recibirás un código SMS o llamada).</li>
-              <li>En <b>Meta for Developers → tu app → WhatsApp → Configuración de la API</b> copia el <b>Phone Number ID</b> y el <b>WhatsApp Business Account ID</b>.</li>
-              <li>En <b>Configuración del negocio → Usuarios del sistema</b> genera un token permanente con permisos <span className="mono">whatsapp_business_messaging</span> y <span className="mono">whatsapp_business_management</span>.</li>
-              <li>Pega los datos en el formulario. Molara verifica el número y suscribe la app a tu cuenta automáticamente.</li>
-            </ol>
-            <div className="divider" style={{ margin: "10px 0" }} />
-            <b>Webhook de la plataforma</b>
-            <p className="muted tiny">Lo configura una sola vez el administrador de la plataforma en la app de Meta (WhatsApp → Configuración → Webhook), campo <span className="mono">messages</span>.</p>
-            <div className="row"><input className="input input-sm mono grow" readOnly value={webhook} /><CopyButton text={webhook} /></div>
-            <p className="tiny">{process.env.WEBHOOK_VERIFY_TOKEN ? "✔ Token de verificación configurado en el servidor (WEBHOOK_VERIFY_TOKEN)." : "⚠ Falta WEBHOOK_VERIFY_TOKEN en las variables de entorno."}</p>
+        <div className="stack" style={{ gap: 22 }}>
+          {acc && (
+            <div className="card">
+              <div className="card-head">
+                <h3>Conexión con Meta</h3>
+                <span className={`badge ${whBadge[0]}`}>{whBadge[1]}</span>
+              </div>
+              <div className="card-pad" style={{ paddingTop: 4 }}>
+                {steps.length ? (
+                  <ul className="setup-list">
+                    {steps.map((st) => (
+                      <li key={st.key} className={`setup-step s-${st.state}`}>
+                        <span className="setup-ic" aria-hidden>{st.state === "ok" ? "✓" : st.state === "warn" ? "!" : st.state === "error" ? "✕" : "…"}</span>
+                        <span><b>{st.label}</b><span className="tiny muted" style={{ display: "block" }}>{st.detail}</span></span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="small muted">Este número se conectó antes de la configuración automática. Presiona “Reconfigurar webhook” para que Molara lo configure en Meta.</p>
+                )}
+                <div className="divider" style={{ margin: "12px 0" }} />
+                <div className="tiny muted stack-sm">
+                  <span>Última verificación de Meta: <b>{fmt(acc.webhook_verified_at)}</b></span>
+                  <span>Último mensaje recibido: <b>{fmt(acc.webhook_last_event_at)}</b></span>
+                  {acc.token_expires_at && <span style={{ color: "#9a5b00" }}>⚠ El token vence el {fmt(acc.token_expires_at)}. Reemplázalo por uno permanente.</span>}
+                </div>
+                {role !== "staff" && (
+                  <div style={{ marginTop: 14 }}>
+                    <ActionForm action={reconfigureWebhook} className="form-grid">
+                      <div><Submit className="btn btn-sm" pendingText="Configurando en Meta…">↻ Reconfigurar webhook</Submit></div>
+                    </ActionForm>
+                  </div>
+                )}
+                {!isPublic && (
+                  <div className="alert alert-info tiny" style={{ marginTop: 12 }}>
+                    Estás en un entorno local ({appUrl || "sin URL"}). Meta solo puede enviar mensajes a una URL pública https: el webhook se configurará automáticamente al publicar la plataforma.
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          <div className="card">
+            <div className="card-head"><h3>¿Dónde encuentro estos datos?</h3></div>
+            <div className="card-pad stack-sm small">
+              <ol style={{ margin: 0, paddingLeft: 18, display: "grid", gap: 10 }}>
+                <li>En <a href="https://business.facebook.com/wa/manage/home/" target="_blank" style={{ color: "var(--teal)" }}>WhatsApp Manager</a> agrega el número del consultorio (recibirás un código por SMS o llamada).</li>
+                <li>En <a href="https://developers.facebook.com/apps/" target="_blank" style={{ color: "var(--teal)" }}>Meta for Developers</a> abre tu app → <b>WhatsApp → Configuración de la API</b>: copia el <b>Phone Number ID</b> y el <b>WhatsApp Business Account ID</b>.</li>
+                <li>En la misma app → <b>Configuración de la app → Básica</b>: copia el <b>App ID</b> y la <b>Clave secreta</b> (App Secret).</li>
+                <li>En <b>Configuración del negocio → Usuarios del sistema</b> genera un token permanente con <span className="mono">whatsapp_business_messaging</span> y <span className="mono">whatsapp_business_management</span>, asignando tu cuenta de WhatsApp.</li>
+              </ol>
+              <div className="alert alert-ok tiny" style={{ marginTop: 6 }}>
+                <b>No necesitas configurar el webhook en Meta.</b> Al presionar “Conectar automáticamente”, Molara valida tus datos, suscribe tu app y registra en Meta una ruta exclusiva para tu número.
+              </div>
+            </div>
           </div>
         </div>
       </div>

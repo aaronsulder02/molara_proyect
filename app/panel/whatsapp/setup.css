@@ -1,0 +1,9 @@
+/* ── Conexión automática con Meta ───────────────────────────── */
+.setup-list { list-style: none; margin: 0; padding: 0; display: grid; }
+.setup-step { display: flex; gap: 12px; align-items: flex-start; padding: 11px 0; border-bottom: 1px dashed var(--line); }
+.setup-step:last-child { border-bottom: 0; }
+.setup-ic { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; flex: none; font-size: 12px; font-weight: 800; margin-top: 1px; }
+.s-ok .setup-ic { background: var(--teal); color: #fff; }
+.s-warn .setup-ic { background: #FFB547; color: #3b2600; }
+.s-error .setup-ic { background: #e5484d; color: #fff; }
+.s-skip .setup-ic { border: 2px solid var(--line-2); color: var(--muted); }
