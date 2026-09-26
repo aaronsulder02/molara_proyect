@@ -102,6 +102,7 @@ async function say(msg: any) {
   await handleInbound(acc, msg, { wa_id: msg.from, profile: { name: "Paciente" } });
   const out = sent.slice(before);
   out.forEach(validate);
+  for (const o of out) assert.ok(!/^🎤|Anot(é|ado):/.test(bodyOf(o) ?? ""), `no debe repetir la transcripción al paciente: ${bodyOf(o)}`);
   return out;
 }
 const rows = (p: any) => p.interactive.action.sections.flatMap((s: any) => s.rows);
@@ -131,15 +132,15 @@ async function main() {
   /* ═══ A) Formulario completo en 5 notas de voz (sin IA de extracción) ═══ */
   const P1 = "56911110001";
   let out = await say(voice(P1, "Hola, buenas tardes, quiero agendar una limpieza"));
-  assert.equal(out[0].type, "text"); assert.match(bodyOf(out[0]), /🎤 _“Hola, buenas tardes, quiero agendar una limpieza”_/); assert.match(bodyOf(out[0]), /Anoté: 🦷 Limpieza dental/);
-  assert.equal(out[1].interactive.type, "list"); assert.ok(rows(out[1])[0].id.startsWith("day:"), "pide el día");
+  assert.equal(out.length, 1, "responde directo, sin eco de la transcripción");
+  assert.equal(out[0].interactive.type, "list"); assert.ok(rows(out[0])[0].id.startsWith("day:"), "pide el día"); assert.match(bodyOf(out[0]), /Limpieza dental/);
   const { rows: [m1] } = await pool.query(`select body, type, payload from messages where wa_message_id=$1`, [`wamid.v${n}`]);
   assert.equal(m1.body, "🎤 Hola, buenas tardes, quiero agendar una limpieza"); assert.equal(m1.type, "audio"); assert.equal(m1.payload.transcript, "Hola, buenas tardes, quiero agendar una limpieza");
-  ok("Audio 1: transcrito, eco al paciente, guardado en la bandeja y pide el día");
+  ok("Audio 1: transcrito, sin eco al paciente, guardado en la bandeja y pide el día");
 
   out = await say(voice(P1, `El ${tWord} en la tarde, por favor`));
-  assert.match(bodyOf(out[0]), new RegExp(`📅 ${longDayLabel(target)}`)); assert.match(bodyOf(out[0]), /en la tarde/);
-  const pmRows = rows(out[1]);
+  assert.equal(out.length, 1);
+  const pmRows = rows(out[0]);
   assert.ok(pmRows.length > 0 && pmRows.every((r: any) => r.title >= "13:00"), "solo horarios de la tarde");
   ok(`Audio 2: “el ${tWord} en la tarde” → ${pmRows.length} horarios ≥ 13:00`);
 
@@ -166,8 +167,8 @@ async function main() {
   const P2 = "56911110002";
   await pool.query(`insert into patients(clinic_id, phone, full_name) values ($1,$2,'Pedro Pérez')`, [clinic.id, P2]);
   out = await say(voice(P2, `Necesito una evaluación para el ${tWord} a las 10 y media`));
-  assert.match(bodyOf(out[0]), /Evaluación · 📅 .* · 🕓 10:30 hrs/);
-  assert.equal(out[1].interactive.type, "button"); assert.match(bodyOf(out[1]), /10:30/); assert.match(bodyOf(out[1]), /Evaluación/);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].interactive.type, "button"); assert.match(bodyOf(out[0]), /10:30/); assert.match(bodyOf(out[0]), /Evaluación/);
   ok("Un solo audio con servicio + día + hora → directo a confirmar (paciente conocido)");
 
   out = await say(voice(P2, "mejor a las 11"));
@@ -220,7 +221,6 @@ async function main() {
   nluScript = [{ intencion: "agendar", servicio_id: "servicio-inventado", fecha: "2019-01-01", hora: "99:99" }];
   out = await say(voice(P6, `una evaluación el ${tWord}`));
   assert.ok(rows(out[out.length - 1])[0].title.endsWith("hrs"), "usó lo del parser: evaluación + día → horarios");
-  assert.match(bodyOf(out[0]), /Evaluación/);
   ok("IA devuelve datos inválidos → se descartan y se usa el parser determinista");
 
   nluScript = ["fail"];
@@ -247,7 +247,8 @@ async function main() {
   nluScript = [{}];
   out = await say(voice(P8, "quiero agendar una evaluación"));
   assert.equal(chatAudioCalls, 1, "usó el modelo multimodal de respaldo");
-  assert.match(bodyOf(out[0]), /quiero agendar una evaluación/);
+  const { rows: [m8] } = await pool.query(`select body from messages where wa_message_id=$1`, [`wamid.v${n}`]);
+  assert.equal(m8.body, "🎤 quiero agendar una evaluación");
   ok("STT no habilitado → respaldo multimodal (Gemini) transcribe igual");
 
   sttMode = "empty"; transcripts.clear();
