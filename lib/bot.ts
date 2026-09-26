@@ -584,7 +584,6 @@ async function fillForm(ctx: Ctx, utterance: string, source: "audio" | "text"): 
     ctx.patient = await upsertPatient(c.id, ctx.to, { full_name: titleCase(f.name) });
     await ctx.setState({ awaiting: undefined });
     if (!hasData && st.pending) {
-      if (source === "audio") await ctx.send(wa.text(`🎤 Anotado: *${titleCase(f.name)}*`));
       await confirmPrompt(ctx);
       return true;
     }
@@ -617,28 +616,17 @@ async function fillForm(ctx: Ctx, utterance: string, source: "audio" | "text"): 
   else if (f.range) Object.assign(patch, { wantRange: f.range, wantHm: undefined });
   if (step === "confirm") patch.pending = undefined;
   await ctx.setState(patch);
-  await advance(ctx, source === "audio" ? utterance : undefined);
+  await advance(ctx);
   return true;
 }
 
 /** Avanza el formulario pidiendo solo lo que falta y validando contra la disponibilidad real. */
-async function advance(ctx: Ctx, heard?: string) {
+async function advance(ctx: Ctx) {
   const c = ctx.clinic;
   let st = ctx.conv.state || {};
   const services = await listServices(c.id);
   if (!st.serviceId && services.length === 1) { await ctx.setState({ serviceId: services[0].id }); st = ctx.conv.state; }
   const svc = services.find((s: any) => s.id === st.serviceId);
-
-  // Resumen de lo entendido (siempre tras un audio: el paciente ve qué escuchó el asistente)
-  const parts = [
-    svc ? `🦷 ${svc.name}` : "",
-    st.wantYmd ? `📅 ${longDayLabel(st.wantYmd)}` : "",
-    st.wantHm ? `🕓 ${st.wantHm} hrs` : st.wantRange ? `🕓 en la ${RANGE_LABEL[st.wantRange as Range]}` : "",
-  ].filter(Boolean);
-  if (heard) {
-    const short = heard.length > 160 ? heard.slice(0, 157) + "…" : heard;
-    await ctx.send(wa.text(`🎤 _“${short}”_${parts.length ? `\n📝 Anoté: ${parts.join(" · ")}` : ""}`));
-  }
 
   if (!st.serviceId) return showServices(ctx);
   if (!st.wantYmd) return showDays(ctx, st.serviceId);
