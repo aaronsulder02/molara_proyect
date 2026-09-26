@@ -25,7 +25,7 @@ export type ServiceLite = { id: string; name: string; description?: string | nul
 export const normEs = (s: string) =>
   s
     .normalize("NFD")
-    .replace(/[̀-ͯ]/g, "")
+    .replace(/\p{M}/gu, "")
     .toLowerCase()
     .replace(/(\d)[.:](\d{2})\b/g, "$1:$2") // conserva horas "10:30" / "10.30"
     .replace(/[¿?¡!.,;"“”()]/g, " ")

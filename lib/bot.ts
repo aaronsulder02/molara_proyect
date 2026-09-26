@@ -4,11 +4,13 @@ import { wa, sendWa, markReadTyping, type WaAccount, type Row } from "./whatsapp
 import { getAvailableDays, getSlots, listServices, getService } from "./availability";
 import { bookAppointment, setAppointmentStatus, upcomingForPatient, upsertPatient } from "./booking";
 import { humanDateTime, longDayLabel, shortDayLabel, ymdInTz, hmInTz } from "./time.ts";
-import { aiAvailable, runAgent, type ChatMsg, type ToolDef } from "./ai";
+import { aiAvailable, runAgent, completeJson, type ChatMsg, type ToolDef } from "./ai";
+import { downloadWaMedia, transcribeAudio } from "./voice";
+import { parseEs, mergeFields, extractionPrompt, type FormStep, type Range } from "./nlu";
 
 const APP_URL = () => (process.env.NEXT_PUBLIC_APP_URL || "").replace(/\/$/, "");
 const money = (n?: number | null) => (n ? "$" + n.toLocaleString("es-CL") : "Consultar");
-const norm = (s: string) => s.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().trim();
+const norm = (s: string) => s.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().trim();
 
 type Ctx = {
   acc: WaAccount;
@@ -90,6 +92,10 @@ export async function handleInbound(acc: WaAccount, msg: any, contact: any) {
     },
   };
 
+  // Nota de voz → transcripción (también en modo humano, para que recepción la lea en la bandeja)
+  let voiceText = "";
+  if (kind === "audio") voiceText = await transcribeInbound(ctx, msg);
+
   // Modo humano: el bot no responde (salvo que el paciente pida volver al menú)
   if (conv.mode === "human") {
     if (text && ["menu", "menú", "bot", "asistente", "inicio"].includes(norm(text))) {
@@ -102,7 +108,8 @@ export async function handleInbound(acc: WaAccount, msg: any, contact: any) {
   try {
     if (replyId) return await route(ctx, replyId);
     if (kind === "text" && text) return await onText(ctx, text, isNew);
-    await ctx.send(wa.text("Por ahora solo puedo leer mensajes de texto 🙂"));
+    if (kind === "audio") return await onVoice(ctx, voiceText, isNew);
+    await ctx.send(wa.text("Por ahora puedo leer mensajes de texto y escuchar notas de voz 🙂"));
     return sendMenu(ctx);
   } catch (e: any) {
     console.error("[bot] error", e);
@@ -123,6 +130,8 @@ function parseIncoming(msg: any): { text: string; replyId: string; kind: string 
     }
     case "button": // respuesta rápida de plantilla
       return { text: msg.button?.text ?? "", replyId: msg.button?.payload ?? "", kind: "button" };
+    case "audio":
+      return { text: "", replyId: "", kind: "audio" };
     default:
       return { text: "", replyId: "", kind: msg.type };
   }
@@ -137,14 +146,22 @@ async function route(ctx: Ctx, id: string) {
   switch (cmd) {
     case "menu": return sendMenu(ctx);
     case "book": return showServices(ctx);
-    case "svc": return showDays(ctx, a);
-    case "day": return showSlots(ctx, a, 0);
+    case "svc": {
+      const st = ctx.conv.state || {};
+      if (st.wantYmd || st.wantHm || st.wantRange) { await ctx.setState({ serviceId: a, pending: undefined }); return advance(ctx); }
+      return showDays(ctx, a);
+    }
+    case "day": {
+      const st = ctx.conv.state || {};
+      if (st.wantHm || st.wantRange) { await ctx.setState({ wantYmd: a }); return advance(ctx); }
+      return showSlots(ctx, a, 0);
+    }
     case "more": return showSlots(ctx, a, Number(rest[0] || 0));
     case "slot": return pickSlot(ctx, a, b);
     case "ok": return doBook(ctx);
     case "change": return ctx.conv.state?.serviceId ? showDays(ctx, ctx.conv.state.serviceId) : showServices(ctx);
     case "abort":
-      await ctx.setState({ pending: undefined, awaiting: undefined, rescheduleId: undefined });
+      await ctx.setState({ pending: undefined, awaiting: undefined, rescheduleId: undefined, ...CLEAR_DRAFT });
       return ctx.send(wa.buttons("Listo, no se agendó nada. ¿Te ayudo con algo más?", [
         { id: "book", title: "📅 Agendar hora" },
         { id: "menu", title: "Menú principal" },
@@ -168,6 +185,11 @@ async function route(ctx: Ctx, id: string) {
    ════════════════════════════════════════════════════════════════════ */
 async function onText(ctx: Ctx, text: string, isNew: boolean) {
   const st = ctx.conv.state || {};
+
+  // Si el paciente está llenando el formulario de reserva, lo que escribe completa los campos
+  if (st.step || st.awaiting === "name") {
+    if (await fillForm(ctx, text, "text")) return;
+  }
 
   if (st.awaiting === "name") {
     const name = text.trim().replace(/\s+/g, " ");
@@ -209,6 +231,8 @@ async function keywordRoute(ctx: Ctx, t: string, isNew: boolean) {
    Pantallas (mensajes interactivos)
    ════════════════════════════════════════════════════════════════════ */
 export async function sendMenu(ctx: Ctx, greet = true) {
+  const st = ctx.conv.state || {};
+  if (st.step || st.wantYmd || st.wantHm || st.wantRange) await ctx.setState(CLEAR_DRAFT);
   const name = ctx.patient?.full_name?.split(" ")[0];
   const hello = greet
     ? `${ctx.clinic.bot_welcome || "¡Hola! 👋"}${name ? `\n\nQué gusto saludarte, ${name}.` : ""}\n\n`
@@ -242,6 +266,7 @@ async function showServices(ctx: Ctx) {
     return handoff(ctx, "Sin servicios configurados");
   }
   if (services.length === 1) return showDays(ctx, services[0].id);
+  await ctx.setState({ step: "service" });
   return ctx.send(
     wa.list("¿Qué tipo de atención necesitas? 🦷", "Elegir servicio", [
       {
@@ -259,7 +284,7 @@ async function showServices(ctx: Ctx) {
 async function showDays(ctx: Ctx, serviceId: string) {
   const service = await getService(ctx.clinic.id, serviceId);
   if (!service) return showServices(ctx);
-  await ctx.setState({ serviceId, pending: undefined });
+  await ctx.setState({ serviceId, pending: undefined, step: "day" });
   const days = await getAvailableDays(ctx.clinic, { serviceId, limit: 10 });
   if (!days.length) {
     return ctx.send(wa.buttons(
@@ -277,7 +302,7 @@ async function showDays(ctx: Ctx, serviceId: string) {
 async function showSlots(ctx: Ctx, ymd: string, offset: number) {
   const serviceId = ctx.conv.state?.serviceId;
   if (!serviceId) return showServices(ctx);
-  await ctx.setState({ ymd });
+  await ctx.setState({ ymd, step: "slot" });
   const slots = await getSlots(ctx.clinic, { serviceId, ymd, collapse: true });
   if (!slots.length) {
     await ctx.send(wa.text("Ese día se acaba de llenar 😅. Te muestro otros días:"));
@@ -302,8 +327,8 @@ async function showSlots(ctx: Ctx, ymd: string, offset: number) {
 async function pickSlot(ctx: Ctx, dentistId: string, startISO: string) {
   await ctx.setState({ pending: { dentistId, start: startISO } });
   if (!ctx.patient?.full_name) {
-    await ctx.setState({ awaiting: "name" });
-    return ctx.send(wa.text("¡Excelente elección! ✨ Para dejar la hora a tu nombre, ¿me indicas tu *nombre y apellido*?"));
+    await ctx.setState({ awaiting: "name", step: "name" });
+    return ctx.send(wa.text("¡Excelente elección! ✨ Para dejar la hora a tu nombre, ¿me indicas tu *nombre y apellido*? (puedes escribirlo o decirlo en un audio 🎤)"));
   }
   return confirmPrompt(ctx);
 }
@@ -311,6 +336,7 @@ async function pickSlot(ctx: Ctx, dentistId: string, startISO: string) {
 async function confirmPrompt(ctx: Ctx) {
   const st = ctx.conv.state || {};
   if (!st.pending || !st.serviceId) return showServices(ctx);
+  await ctx.setState({ step: "confirm", awaiting: undefined });
   const service = await getService(ctx.clinic.id, st.serviceId);
   const { data: dentist } = await db().from("dentists").select("name").eq("id", st.pending.dentistId).maybeSingle();
   const lines = [
@@ -349,7 +375,7 @@ async function doBook(ctx: Ctx) {
   if (st.rescheduleId) {
     await setAppointmentStatus(ctx.clinic.id, st.rescheduleId, "cancelled").catch(() => null);
   }
-  await ctx.setState({ pending: undefined, rescheduleId: undefined, ymd: undefined });
+  await ctx.setState({ pending: undefined, rescheduleId: undefined, ymd: undefined, ...CLEAR_DRAFT });
   const a = res.appointment;
   return ctx.send(
     wa.buttons(
@@ -361,6 +387,7 @@ async function doBook(ctx: Ctx) {
 }
 
 async function showMine(ctx: Ctx) {
+  if (ctx.conv.state?.step) await ctx.setState({ step: undefined });
   const list = await upcomingForPatient(ctx.clinic.id, ctx.to);
   if (!list.length) {
     return ctx.send(wa.buttons("No tienes horas agendadas próximamente. ¿Quieres reservar una?", [
@@ -472,6 +499,182 @@ async function sendWebLink(ctx: Ctx) {
 async function handoff(ctx: Ctx, reason: string) {
   await db().from("conversations").update({ mode: "human", state: { ...(ctx.conv.state || {}), handoffReason: reason } }).eq("id", ctx.conv.id);
   return ctx.send(wa.text("Listo 🙌 Le avisé a nuestro equipo de recepción y te responderán por este mismo chat a la brevedad.\n\nSi quieres volver al asistente, escribe *menú*."));
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   Notas de voz + formulario de reserva conversacional
+   El paciente puede dictar (o escribir) servicio, día, hora y nombre en uno o varios
+   mensajes; cada dato se guarda en un borrador y el bot pregunta solo lo que falta.
+   ════════════════════════════════════════════════════════════════════ */
+const CLEAR_DRAFT = { step: undefined, wantYmd: undefined, wantHm: undefined, wantRange: undefined } as const;
+const RANGE_LABEL: Record<Range, string> = { am: "mañana", pm: "tarde", noche: "noche" };
+const inRange = (hm: string, r: Range) => (r === "am" ? hm < "13:00" : r === "pm" ? hm >= "13:00" && hm < "19:00" : hm >= "19:00");
+const minutes = (hm: string) => Number(hm.slice(0, 2)) * 60 + Number(hm.slice(3, 5));
+
+async function transcribeInbound(ctx: Ctx, msg: any): Promise<string> {
+  let transcript = "";
+  try {
+    if (msg.audio?.id && aiAvailable()) {
+      const media = await downloadWaMedia(ctx.acc, msg.audio.id);
+      transcript = (await transcribeAudio(media.data, media.mime)).text;
+    }
+  } catch (e) {
+    console.warn("[voice] no se pudo transcribir:", (e as Error).message);
+  }
+  const body = transcript ? `🎤 ${transcript}` : "🎤 Nota de voz";
+  await db().from("messages").update({ body, payload: { ...msg, transcript: transcript || null } }).eq("wa_message_id", msg.id);
+  await db().from("conversations").update({ last_message: body.slice(0, 140) }).eq("id", ctx.conv.id);
+  return transcript;
+}
+
+async function onVoice(ctx: Ctx, transcript: string, isNew: boolean) {
+  if (!transcript) {
+    return ctx.send(wa.buttons(
+      aiAvailable()
+        ? "🎧 No logré entender bien tu audio. ¿Me lo repites o me lo escribes?"
+        : "🎧 Por ahora no puedo escuchar audios. ¿Me lo escribes, por favor?",
+      [{ id: "book", title: "📅 Agendar hora" }, { id: "menu", title: "Menú principal" }]
+    ));
+  }
+  if (await fillForm(ctx, transcript, "audio")) return;
+  return onText(ctx, transcript, isNew);
+}
+
+/** Qué está viendo el paciente (para que el modelo interprete "el primero", "ese", etc.). */
+async function offeredOptions(ctx: Ctx, step: FormStep): Promise<string | undefined> {
+  const st = ctx.conv.state || {};
+  try {
+    if (step === "day" && st.serviceId) {
+      const days = await getAvailableDays(ctx.clinic, { serviceId: st.serviceId, limit: 10 });
+      return days.map((d) => `${d.ymd} (${shortDayLabel(d.ymd)})`).join(", ");
+    }
+    if (step === "slot" && st.serviceId && st.ymd) {
+      const slots = await getSlots(ctx.clinic, { serviceId: st.serviceId, ymd: st.ymd, collapse: true });
+      return `Día ${st.ymd}: ` + slots.slice(0, 20).map((s) => s.hm).join(", ");
+    }
+    if (step === "confirm" && st.pending) return `Reserva por confirmar: ${humanDateTime(st.pending.start, ctx.clinic.timezone)}`;
+  } catch {}
+  return undefined;
+}
+
+/** Llena el formulario con lo que dijo/escribió el paciente. Devuelve false si no era sobre la reserva. */
+async function fillForm(ctx: Ctx, utterance: string, source: "audio" | "text"): Promise<boolean> {
+  const c = ctx.clinic;
+  const tz = c.timezone;
+  const st = ctx.conv.state || {};
+  const step: FormStep = st.awaiting === "name" ? "name" : st.step;
+  const services = await listServices(c.id);
+  const now = new Date();
+  const today = ymdInTz(now, tz);
+
+  const det = parseEs(utterance, { today, services, step });
+  let f = det;
+  if (aiAvailable() && c.ai_enabled !== false) {
+    const offered = await offeredOptions(ctx, step);
+    const ai = await completeJson(extractionPrompt({ today, now: hmInTz(now, tz), step, services, offered }), utterance);
+    f = mergeFields(ai, det, { today, services, windowDays: Math.min(c.booking_window_days || 30, 60) });
+  }
+  const hasData = !!(f.serviceId || f.ymd || f.hm || f.range);
+
+  if (f.intent === "cancelar" && step) {
+    await route(ctx, "abort");
+    return true;
+  }
+  if (step === "name" && f.name) {
+    ctx.patient = await upsertPatient(c.id, ctx.to, { full_name: titleCase(f.name) });
+    await ctx.setState({ awaiting: undefined });
+    if (!hasData && st.pending) {
+      if (source === "audio") await ctx.send(wa.text(`🎤 Anotado: *${titleCase(f.name)}*`));
+      await confirmPrompt(ctx);
+      return true;
+    }
+  }
+  if (step === "confirm" && f.intent === "confirmar" && st.pending) {
+    // "sí, el jueves a las 4 está bien": confirma si lo dicho coincide con la reserva mostrada
+    const pDay = ymdInTz(new Date(st.pending.start), tz);
+    const pHm = hmInTz(new Date(st.pending.start), tz);
+    const same = (!f.ymd || f.ymd === pDay) && (!f.hm || f.hm === pHm) && (!f.serviceId || f.serviceId === st.serviceId) && !f.range;
+    if (same) { await doBook(ctx); return true; }
+  }
+  if (step === "confirm" && !hasData) {
+    if (f.intent === "rechazar" || f.intent === "cambiar") { await route(ctx, "change"); return true; }
+  }
+  if (!hasData) return step === "name" && !!f.name;
+  // Pregunta informativa que menciona un servicio ("¿cuánto cuesta la limpieza?") → la responde el agente
+  if (f.intent === "otra" && !f.ymd && !f.hm && !f.range) return false;
+
+  if (f.name && !ctx.patient?.full_name) ctx.patient = await upsertPatient(c.id, ctx.to, { full_name: titleCase(f.name) });
+
+  const patch: Record<string, any> = { awaiting: undefined };
+  if (f.serviceId && f.serviceId !== st.serviceId) Object.assign(patch, { serviceId: f.serviceId, pending: undefined });
+  if (f.ymd) patch.wantYmd = f.ymd;
+  else if (!st.wantYmd && (f.hm || f.range)) {
+    // "mejor a las 5": mismo día que estaba mirando o el de la reserva por confirmar
+    const day = st.pending?.start ? ymdInTz(new Date(st.pending.start), tz) : step === "slot" ? st.ymd : undefined;
+    if (day) patch.wantYmd = day;
+  }
+  if (f.hm) Object.assign(patch, { wantHm: f.hm, wantRange: undefined });
+  else if (f.range) Object.assign(patch, { wantRange: f.range, wantHm: undefined });
+  if (step === "confirm") patch.pending = undefined;
+  await ctx.setState(patch);
+  await advance(ctx, source === "audio" ? utterance : undefined);
+  return true;
+}
+
+/** Avanza el formulario pidiendo solo lo que falta y validando contra la disponibilidad real. */
+async function advance(ctx: Ctx, heard?: string) {
+  const c = ctx.clinic;
+  let st = ctx.conv.state || {};
+  const services = await listServices(c.id);
+  if (!st.serviceId && services.length === 1) { await ctx.setState({ serviceId: services[0].id }); st = ctx.conv.state; }
+  const svc = services.find((s: any) => s.id === st.serviceId);
+
+  // Resumen de lo entendido (siempre tras un audio: el paciente ve qué escuchó el asistente)
+  const parts = [
+    svc ? `🦷 ${svc.name}` : "",
+    st.wantYmd ? `📅 ${longDayLabel(st.wantYmd)}` : "",
+    st.wantHm ? `🕓 ${st.wantHm} hrs` : st.wantRange ? `🕓 en la ${RANGE_LABEL[st.wantRange as Range]}` : "",
+  ].filter(Boolean);
+  if (heard) {
+    const short = heard.length > 160 ? heard.slice(0, 157) + "…" : heard;
+    await ctx.send(wa.text(`🎤 _“${short}”_${parts.length ? `\n📝 Anoté: ${parts.join(" · ")}` : ""}`));
+  }
+
+  if (!st.serviceId) return showServices(ctx);
+  if (!st.wantYmd) return showDays(ctx, st.serviceId);
+
+  const ymd: string = st.wantYmd;
+  const slots = await getSlots(c, { serviceId: st.serviceId, ymd, collapse: true });
+  await ctx.setState({ ymd, wantYmd: undefined });
+  if (!slots.length) {
+    await ctx.send(wa.text(`Para el *${longDayLabel(ymd)}* no me quedan horas de ${svc?.name ?? "ese servicio"} 😕. Estos días sí tienen:`));
+    return showDays(ctx, st.serviceId);
+  }
+  if (st.wantHm) {
+    const exact = slots.find((s) => s.hm === st.wantHm);
+    await ctx.setState({ wantHm: undefined, wantRange: undefined });
+    if (exact) return pickSlot(ctx, exact.dentistId, exact.start);
+    const target = minutes(st.wantHm);
+    const near = [...slots].sort((a, b) => Math.abs(minutes(a.hm) - target) - Math.abs(minutes(b.hm) - target)).slice(0, 10).sort((a, b) => a.hm.localeCompare(b.hm));
+    return sendSlotList(ctx, ymd, near, `A las *${st.wantHm}* no me queda hora el ${longDayLabel(ymd)}. Lo más cercano 👇`);
+  }
+  if (st.wantRange) {
+    const r = st.wantRange as Range;
+    const inR = slots.filter((s) => inRange(s.hm, r));
+    await ctx.setState({ wantRange: undefined });
+    if (inR.length) return sendSlotList(ctx, ymd, inR.slice(0, 10), `Horarios en la *${RANGE_LABEL[r]}* del ${longDayLabel(ymd)} 👇`);
+    await ctx.send(wa.text(`En la ${RANGE_LABEL[r]} del ${longDayLabel(ymd)} ya no quedan horas. Te muestro todo ese día:`));
+  }
+  return showSlots(ctx, ymd, 0);
+}
+
+async function sendSlotList(ctx: Ctx, ymd: string, slots: { dentistId: string; dentistName: string; start: string; hm: string }[], body: string) {
+  await ctx.setState({ ymd, step: "slot" });
+  return ctx.send(
+    wa.list(body, "Elegir horario", [
+      { title: "Horarios", rows: slots.slice(0, 10).map((s) => ({ id: `slot:${s.dentistId}:${s.start}`, title: `${s.hm} hrs`, description: `con ${s.dentistName}` })) },
+    ], { header: "Agendar hora", footer: "Toca un horario o dímelo en un audio 🎤" })
+  );
 }
 
 /* ════════════════════════════════════════════════════════════════════
