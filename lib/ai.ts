@@ -72,3 +72,32 @@ export async function runAgent(opts: {
   }
   return "";
 }
+
+/**
+ * Extracción estructurada: devuelve el JSON que produce el modelo (o null si falla).
+ * Temperatura 0 y salida corta; se usa para llenar el formulario de reserva desde texto o voz.
+ */
+export async function completeJson(system: string, user: string): Promise<any | null> {
+  const token = aiToken();
+  if (!token) return null;
+  try {
+    const r = await fetch(GATEWAY, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: process.env.AI_NLU_MODEL || process.env.AI_MODEL || "openai/gpt-4.1-mini",
+        messages: [{ role: "system", content: system }, { role: "user", content: user }],
+        temperature: 0,
+        max_tokens: 220,
+        response_format: { type: "json_object" },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const raw = String(j.choices?.[0]?.message?.content ?? "").replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
