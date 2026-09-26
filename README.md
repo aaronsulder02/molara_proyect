@@ -40,6 +40,15 @@ Al conectar un número, `lib/metaConnect.ts`:
 
 El webhook acepta la firma `X-Hub-Signature-256` del App Secret de **cada** número incluido en el evento (o el de la plataforma), así un consultorio no puede firmar eventos de otro. En local (sin URL https pública) el webhook queda *pendiente* y se activa solo al publicar (botón “Reconfigurar webhook” o el cron diario).
 
+### Agendar por notas de voz 🎤
+
+El paciente puede dictar la reserva en uno o varios audios ("quiero una limpieza" → "el jueves en la tarde" → "a las 4" → "me llamo Camila Rojas" → "sí, confírmala"):
+
+1. `lib/voice.ts` descarga el audio desde Meta y lo transcribe con el **Speech-to-Text del AI Gateway** (`AI_STT_MODEL`); si no está habilitado, usa un modelo multimodal (`AI_AUDIO_MODEL`) como respaldo.
+2. `lib/nlu.ts` extrae servicio, día, hora/franja, nombre e intención: un parser determinista en español de Chile + extracción JSON con IA (validada campo a campo).
+3. El formulario (`fillForm`/`advance` en `lib/bot.ts`) guarda un borrador, pregunta solo lo que falta, valida contra la disponibilidad real (hora exacta, las más cercanas o la franja pedida) y responde con el eco de lo que escuchó ("🎤 … 📝 Anoté: …"). También funciona escribiendo mientras se ve cualquier paso del formulario.
+4. La transcripción queda en la bandeja (`🎤 texto`), incluso en modo humano.
+
 > Recordatorios fuera de la ventana de 24 h: crea en Meta una plantilla UTILITY con `{{1}}` nombre, `{{2}}` fecha/hora, `{{3}}` consultorio y 2 botones rápidos (Confirmo / Cancelar), y escribe su nombre en *Ajustes → Asistente*.
 
 ## Pruebas
@@ -47,7 +56,8 @@ El webhook acepta la firma `X-Hub-Signature-256` del App Secret de **cada** núm
 ```bash
 npm test                          # motor de disponibilidad y zona horaria
 npm i -D tsx pg && npx tsx tests/e2e/bot.e2e.ts   # chatbot de punta a punta contra Postgres local
-npx tsx --test tests/metaConnect.test.ts          # conexión automática (unitarias)
+npx tsx --test tests/metaConnect.test.ts tests/nlu.test.ts   # conexión automática y lenguaje (unitarias)
+npx tsx tests/e2e/voice.e2e.ts                    # agendar por notas de voz de punta a punta
 # E2E de conexión automática con Meta simulado (Graph API falsa que verifica callbacks y firma eventos):
 #   npx tsx tests/e2e/fakeSupabase.ts & LOCAL_BASE=http://127.0.0.1:3100 npx tsx tests/e2e/fakeMeta.ts &
 #   NEXT_PUBLIC_APP_URL=https://molara.test META_GRAPH_URL=http://127.0.0.1:5555 (…) next build && next start -p 3100
