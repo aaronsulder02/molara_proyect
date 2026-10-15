@@ -2,6 +2,7 @@ import { requireContext } from "@/lib/session";
 import { ActionForm, CopyButton } from "@/components/ActionForm";
 import { Submit } from "@/components/Submit";
 import { aiAvailable } from "@/lib/ai";
+import { db } from "@/lib/supabase";
 import { changePassword, saveBot, saveClinic } from "../actions";
 import { saveReviewLink } from "./reviewAction";
 
@@ -13,6 +14,8 @@ export default async function Ajustes() {
   const appUrl = (process.env.NEXT_PUBLIC_APP_URL || "").replace(/\/$/, "");
   const link = `${appUrl}/reservar/${clinic.slug}`;
   const ai = aiAvailable();
+  const { data: igAcc } = await db().from("instagram_accounts").select("username").eq("clinic_id", clinic.id).maybeSingle();
+  const igHandle = clinic.instagram_handle || igAcc?.username;
 
   return (
     <div className="stack" style={{ gap: 22 }}>
@@ -83,11 +86,18 @@ export default async function Ajustes() {
           </div>
 
           <div className="card">
-            <div className="card-head"><h3>Reseñas en Google</h3>{clinic.google_review_url ? <span className="badge b-confirmed">Activo</span> : <span className="badge b-pending">Sin link</span>}</div>
+            <div className="card-head"><h3>Reseñas e Instagram</h3>{clinic.google_review_url || igHandle ? <span className="badge b-confirmed">Activo</span> : <span className="badge b-pending">Sin configurar</span>}</div>
             <ActionForm action={saveReviewLink} className="card-pad form-grid">
               <fieldset disabled={!admin} style={{ border: 0, padding: 0, margin: 0, display: "grid", gap: 14 }}>
-                <label className="field"><span>Link para dejar reseña</span><input className="input" name="google_review_url" type="url" defaultValue={clinic.google_review_url ?? ""} placeholder="https://g.page/r/XXXXXXXX/review" /><span className="hint">Google Perfil de Empresa → «Pedir reseñas» → copiar link. Al terminar una reserva, el asistente invita al paciente a dejar su reseña (máximo una vez al mes por paciente).</span></label>
-                {admin && <div><Submit>Guardar link</Submit></div>}
+                <label className="field"><span>Instagram del consultorio</span><input className="input" name="instagram_handle" defaultValue={clinic.instagram_handle ?? ""} placeholder={igAcc?.username ? `@${igAcc.username} (cuenta conectada)` : "@tuconsultorio"} /><span className="hint">Al terminar una reserva, el asistente invita al paciente a seguirlos (una vez cada 3 meses por paciente). Si lo dejas vacío se usa la cuenta conectada en «Instagram».</span></label>
+                <label className="field"><span>Beneficio por seguirlos (opcional)</span><input className="input" name="instagram_perk" maxLength={120} defaultValue={clinic.instagram_perk ?? ""} placeholder="10% de descuento en tu próxima limpieza" /><span className="hint">Un regalo concreto multiplica los seguidores. El paciente lo muestra en recepción el día de su cita.</span></label>
+                <label className="field"><span>Link para dejar reseña en Google</span><input className="input" name="google_review_url" type="url" defaultValue={clinic.google_review_url ?? ""} placeholder="https://g.page/r/XXXXXXXX/review" /><span className="hint">Google Perfil de Empresa → «Pedir reseñas» → copiar link. Se envía el día siguiente a la cita.</span></label>
+                <div className="form-row">
+                  <label className="field"><span>Plantilla de reseña (Meta)</span><input className="input mono" name="review_template" defaultValue={clinic.review_template ?? ""} placeholder="resena_google" /></label>
+                  <label className="field"><span>Idioma</span><input className="input mono" name="review_template_lang" defaultValue={clinic.review_template_lang ?? "es"} /></label>
+                </div>
+                <span className="hint" style={{ marginTop: -6 }}>Sin plantilla aprobada, la reseña solo llega a quienes escribieron en las últimas 24 h (regla de WhatsApp). Cuerpo: {"{{1}}"} nombre, {"{{2}}"} consultorio + botón con tu link de reseña.</span>
+                {admin && <div><Submit>Guardar fidelización</Submit></div>}
               </fieldset>
             </ActionForm>
           </div>
