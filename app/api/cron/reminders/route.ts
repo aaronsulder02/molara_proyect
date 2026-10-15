@@ -1,12 +1,12 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/supabase";
-import { sendRemindersForClinic } from "@/lib/bot";
+import { sendRemindersForClinic, sendReviewRequestsForClinic } from "@/lib/bot";
 import { runSetup, isPublicHttps, publicAppUrl } from "@/lib/metaConnect";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-/** Cron diario (vercel.json): recordatorio a los pacientes con hora para mañana. */
+/** Cron diario (vercel.json): recordatorio a los pacientes con hora para mañana + reseña en Google a los atendidos ayer. */
 export async function GET(req: Request) {
   const secret = process.env.CRON_SECRET;
   if (secret && req.headers.get("authorization") !== `Bearer ${secret}`) {
@@ -25,7 +25,7 @@ export async function GET(req: Request) {
   const results: any[] = [];
   for (const acc of accounts ?? []) {
     try {
-      results.push({ clinic: acc.clinic?.name, ...(await sendRemindersForClinic(acc.clinic, acc)) });
+      results.push({ clinic: acc.clinic?.name, ...(await sendRemindersForClinic(acc.clinic, acc)), reviews: await sendReviewRequestsForClinic(acc.clinic, acc) });
     } catch (e: any) {
       results.push({ clinic: acc.clinic?.name, error: e?.message });
     }

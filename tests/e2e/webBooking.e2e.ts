@@ -1,10 +1,11 @@
 // E2E: reserva hecha en la agenda web → el paciente escribe por WhatsApp el mensaje prellenado.
 // El bot debe VERIFICAR la cita existente (nombre/código/celular), nunca responder "no hay horarios",
-// manejar un celular distinto al del chat y, al terminar, invitar a dejar una reseña en Google.
+// manejar un celular distinto al del chat y, al terminar, invitar a seguir el Instagram (con beneficio).
+// La reseña en Google se pide el DÍA SIGUIENTE a la cita (cron).
 import assert from "node:assert/strict";
 import { fakeDb } from "./fakeDb";
 import { __setDbForTests } from "../../lib/supabase";
-import { handleInbound } from "../../lib/bot";
+import { handleInbound, sendReviewRequestsForClinic, cleanHandle } from "../../lib/bot";
 import { bookAppointment } from "../../lib/booking";
 import { getSlots } from "../../lib/availability";
 import { addDaysYmd, ymdInTz, weekdayOfYmd } from "../../lib/time.ts";
@@ -71,7 +72,9 @@ async function main() {
   await pool.query("truncate clinics cascade");
   const REVIEW = "https://g.page/r/CLINICA-DEMO/review";
   const { rows: [clinic] } = await pool.query(
-    `insert into clinics(name, slug, address, city, min_notice_min, ai_enabled, google_review_url) values ('Dr Gregorio','dr-gregorio','Av. Siempre Viva 742','Santiago',0,true,$1) returning *`, [REVIEW]);
+    `insert into clinics(name, slug, address, city, min_notice_min, ai_enabled, google_review_url, instagram_handle, instagram_perk) values ('Dr Gregorio','dr-gregorio','Av. Siempre Viva 742','Santiago',0,true,$1,'clinicadrgregorio','10% de descuento en tu próxima limpieza') returning *`, [REVIEW]);
+  const IG = "https://www.instagram.com/clinicadrgregorio/";
+  const isFollow = (p: any) => p?.interactive?.type === "cta_url" && p.interactive.action.parameters.url === IG;
   acc.clinic_id = clinic.id;
   const tz = clinic.timezone;
   await pool.query(`insert into whatsapp_accounts(clinic_id, phone_number_id, waba_id, access_token, display_phone) values ($1,'999000333','888','tok','+56 9 3333 3333')`, [clinic.id]);
@@ -101,8 +104,11 @@ async function main() {
   assert.equal(out[0].interactive.header.text, "Reserva verificada");
   assert.match(bodyOf(out[0]), /Salomon/); assert.match(bodyOf(out[0]), /Evaluación odontológica/); assert.match(bodyOf(out[0]), /10:00/); assert.match(bodyOf(out[0]), /Dr\. Gregorio/);
   assert.deepEqual(ids(out[0]), [`aok:${a1.id}`, `arb:${a1.id}`, `acx:${a1.id}`]);
-  assert.equal(out[1].interactive.type, "cta_url"); assert.equal(out[1].interactive.action.parameters.url, REVIEW);
-  ok("Mensaje prellenado de la web → encuentra la cita, celular coincide → «Reserva verificada» + reseña en Google");
+  assert.ok(isFollow(out[1]), "invita a seguir el Instagram");
+  assert.match(bodyOf(out[1]), /regalo antes de irte, Salomon/); assert.match(bodyOf(out[1]), /10% de descuento en tu próxima limpieza/);
+  assert.equal(out[1].interactive.action.parameters.display_text, "Seguir y ganar 🎁"); assert.equal(out[1].interactive.footer.text, "@clinicadrgregorio");
+  assert.ok(!out.some((o) => o.interactive?.action?.parameters?.url === REVIEW), "la reseña ya no se pide al reservar");
+  ok("Mensaje prellenado de la web → «Reserva verificada» + invitación a Instagram con beneficio (sin reseña todavía)");
 
   out = await say(btn(SALOMON, `aok:${a1.id}`));
   assert.match(bodyOf(out[0]), /Gracias por confirmar/);
@@ -124,8 +130,8 @@ async function main() {
   assert.match(bodyOf(out[0]), /avisos de esta cita llegarán a este WhatsApp/); assert.match(bodyOf(out[0]), /Nancy/);
   const { rows: [c2] } = await pool.query(`select p.phone, p.full_name from appointments a join patients p on p.id=a.patient_id where a.id=$1`, [a2.id]);
   assert.equal(c2.phone, CHAT); assert.equal(c2.full_name, "Nancy Menes");
-  assert.equal(out[1].interactive.type, "cta_url");
-  ok("«Sí, a este número» → la cita pasa al celular del chat (recordatorios llegan aquí) + reseña");
+  assert.ok(isFollow(out[1]));
+  ok("«Sí, a este número» → la cita pasa al celular del chat (recordatorios llegan aquí) + Instagram");
 
   out = await say(btn(CHAT, `wlink:${a2.id}`));
   assert.ok(!bodyOf(out[0]).includes("avisos de esta cita"), "botón viejo no vuelve a reasignar");
@@ -157,10 +163,10 @@ async function main() {
   assert.equal(out[0].interactive.header.text, "Reserva verificada"); assert.ok(ids(out[0]).includes(`aok:${a5.id}`));
   ok("Código de reserva identifica la cita aunque el nombre no coincida exacto");
 
-  /* ═══ 6) Reseña: máximo una vez cada 30 días por paciente ═══ */
+  /* ═══ 6) Instagram: máximo una vez cada 90 días por paciente ═══ */
   out = await say(txt(SALOMON, webMessage(EVAL.name, s10, "Salomon Carrillo", tz)));
-  assert.equal(out.length, 1, "segunda verificación sin repetir la invitación a reseña");
-  ok("No se repite la invitación a reseña al mismo paciente");
+  assert.equal(out.length, 1, "segunda verificación sin repetir la invitación");
+  ok("No se repite la invitación a Instagram al mismo paciente");
 
   /* ═══ 7) Mismo paciente no puede tener dos horas que se crucen (otro profesional) ═══ */
   const s16 = await at("16:00", g.id, EVAL.id);
@@ -175,17 +181,17 @@ async function main() {
   const s14 = await at("14:00", g.id, EVAL.id);
   await pool.query(`insert into conversations(clinic_id, wa_id, state) values ($1,$2,$3)`, [clinic.id, NEW, JSON.stringify({ serviceId: EVAL.id, pending: { dentistId: g.id, start: s14 }, step: "confirm" })]);
   out = await say(btn(NEW, "ok"));
-  assert.match(bodyOf(out[0]), /agendada/); assert.equal(out[1].interactive.type, "cta_url");
-  ok("Reserva hecha por WhatsApp → mensaje de cita agendada + botón «Dejar reseña»");
+  assert.match(bodyOf(out[0]), /agendada/); assert.ok(isFollow(out[1]));
+  ok("Reserva hecha por WhatsApp → cita agendada + invitación a Instagram");
 
-  /* ═══ 9) Sin link de reseñas configurado → no se envía nada extra ═══ */
-  await pool.query(`update clinics set google_review_url=null where id=$1`, [clinic.id]);
+  /* ═══ 9) Sin Instagram configurado → solo la verificación ═══ */
+  await pool.query(`update clinics set instagram_handle=null where id=$1`, [clinic.id]);
   const LUIS = "56922221111";
   const s15 = await at("15:00", g.id, EVAL.id);
   await web(EVAL.id, s15, g.id, "Luis Mena", "+56 9 2222 1111");
   out = await say(txt(LUIS, webMessage(EVAL.name, s15, "Luis Mena", tz)));
   assert.equal(out.length, 1);
-  ok("Consultorio sin link de reseñas → solo la verificación");
+  ok("Consultorio sin Instagram → solo la verificación");
 
   /* ═══ 10) El agente IA conoce las citas del paciente ═══ */
   aiCalls.length = 0;
@@ -195,6 +201,55 @@ async function main() {
   assert.match(sys, /Próximas citas de este paciente: Evaluación odontológica con Dr\. Gregorio/);
   assert.match(sys, /YA reservó/);
   ok("Contexto del agente incluye las próximas citas del paciente y la regla de reservas existentes");
+
+  /* ═══ 11) Instagram conectado en el panel y sin beneficio → texto de exclusividad ═══ */
+  await pool.query(`insert into instagram_accounts(clinic_id, ig_user_id, access_token, username) values ($1,'17841','tok','dr.gregorio.dental')`, [clinic.id]);
+  const s0930 = await at("09:30", g.id, EVAL.id);
+  const SOFIA = "56988887777";
+  await web(EVAL.id, s0930, g.id, "Sofía Lagos", SOFIA);
+  await pool.query(`update clinics set instagram_perk=null where id=$1`, [clinic.id]);
+  out = await say(txt(SOFIA, webMessage(EVAL.name, s0930, "Sofía Lagos", tz)));
+  assert.equal(out[1].interactive.action.parameters.url, "https://www.instagram.com/dr.gregorio.dental/");
+  assert.match(bodyOf(out[1]), /Ya nos sigues, Sofía/); assert.match(bodyOf(out[1]), /promociones exclusivas para seguidores/);
+  assert.equal(out[1].interactive.action.parameters.display_text, "Seguir en Instagram");
+  ok("Sin beneficio → «¿Ya nos sigues?» con la cuenta conectada en Instagram");
+  assert.equal(cleanHandle("https://www.instagram.com/Clinica_Sonrie/?hl=es"), "Clinica_Sonrie"); assert.equal(cleanHandle("@dr.paz"), "dr.paz"); assert.equal(cleanHandle("no válido!"), null);
+  ok("Usuario de Instagram aceptado como @usuario o link del perfil");
+
+  /* ═══ 12) Cron: reseña en Google el día siguiente a la cita ═══ */
+  await pool.query(`update clinics set google_review_url=$2 where id=$1`, [clinic.id, REVIEW]);
+  const { rows: [cl2] } = await pool.query(`select * from clinics where id=$1`, [clinic.id]);
+  const yday = addDaysYmd(ymdInTz(new Date(), tz), -1);
+  const past = async (phone: string, name: string, hm: string, status = "confirmed", dentistId = g.id) => {
+    const { rows: [p] } = await pool.query(`insert into patients(clinic_id, phone, full_name) values ($1,$2,$3) on conflict (clinic_id, phone) do update set full_name=excluded.full_name returning id`, [clinic.id, phone, name]);
+    const { rows: [a] } = await pool.query(`insert into appointments(clinic_id, patient_id, dentist_id, service_id, starts_at, ends_at, status, channel) values ($1,$2,$3,$4,($5::date + $6::time) at time zone $7, ($5::date + $6::time + interval '30 min') at time zone $7, $8, 'web') returning id`, [clinic.id, p.id, dentistId, EVAL.id, yday, hm, tz, status]);
+    return a.id;
+  };
+  const R1 = "56910101010", R2 = "56920202020", R3 = "56930303030";
+  const r1 = await past(R1, "Marta Ríos", "10:00");                     // escribió hace poco → ventana abierta
+  await pool.query(`insert into conversations(clinic_id, wa_id, last_inbound_at) values ($1,$2, now() - interval '3 hours')`, [clinic.id, R1]);
+  await past(R2, "Hugo Vera", "11:00");                                  // sin ventana y sin plantilla → se omite
+  await past(R3, "Inés Toro", "12:00", "cancelled");                      // cancelada → nunca
+  const before = sent.length;
+  let rv = await sendReviewRequestsForClinic(cl2, acc);
+  const msgs = sent.slice(before);
+  assert.deepEqual({ sent: rv.sent, skipped: rv.skipped }, { sent: 1, skipped: 1 });
+  assert.equal(msgs[0].to, R1); assert.equal(msgs[0].interactive.action.parameters.url, REVIEW);
+  assert.match(bodyOf(msgs[0]), /Gracias por visitarnos ayer en \*Dr Gregorio\*/); assert.match(bodyOf(msgs[0]), /Evaluación odontológica/);
+  const { rows: [rr] } = await pool.query(`select review_requested_at from appointments where id=$1`, [r1]);
+  assert.ok(rr.review_requested_at);
+  ok("Día siguiente: reseña con botón a quien tiene la ventana de 24 h abierta; cancelada excluida");
+
+  rv = await sendReviewRequestsForClinic(cl2, acc);
+  assert.equal(rv.sent, 0, "no se repite");
+  await pool.query(`update clinics set review_template='resena_google' where id=$1`, [clinic.id]);
+  const { rows: [cl3] } = await pool.query(`select * from clinics where id=$1`, [clinic.id]);
+  const b2 = sent.length;
+  rv = await sendReviewRequestsForClinic(cl3, acc);
+  const tpl = sent.slice(b2)[0];
+  assert.equal(rv.sent, 1); assert.equal(tpl.to, R2); assert.equal(tpl.type, "template"); assert.equal(tpl.template.name, "resena_google");
+  assert.deepEqual(tpl.template.components[0].parameters.map((x: any) => x.text), ["Hugo", "Dr Gregorio"]);
+  ok("Fuera de la ventana de 24 h → usa la plantilla aprobada; nunca repite al mismo paciente");
 
   console.log(`\nReservas web ↔ WhatsApp: todos los escenarios OK · ${sent.length} mensajes validados contra los límites de Meta.`);
   await pool.end();
