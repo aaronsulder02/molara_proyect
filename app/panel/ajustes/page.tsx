@@ -3,6 +3,7 @@ import { ActionForm, CopyButton } from "@/components/ActionForm";
 import { Submit } from "@/components/Submit";
 import { aiAvailable } from "@/lib/ai";
 import { changePassword, saveBot, saveClinic } from "../actions";
+import { saveReviewLink } from "./reviewAction";
 
 export const metadata = { title: "Ajustes" };
 
@@ -77,6 +78,16 @@ export default async function Ajustes() {
                   <label className="field"><span>Idioma</span><input className="input mono" name="reminder_template_lang" defaultValue={clinic.reminder_template_lang ?? "es"} /></label>
                 </div>
                 {admin && <div><Submit>Guardar asistente</Submit></div>}
+              </fieldset>
+            </ActionForm>
+          </div>
+
+          <div className="card">
+            <div className="card-head"><h3>Reseñas en Google</h3>{clinic.google_review_url ? <span className="badge b-confirmed">Activo</span> : <span className="badge b-pending">Sin link</span>}</div>
+            <ActionForm action={saveReviewLink} className="card-pad form-grid">
+              <fieldset disabled={!admin} style={{ border: 0, padding: 0, margin: 0, display: "grid", gap: 14 }}>
+                <label className="field"><span>Link para dejar reseña</span><input className="input" name="google_review_url" type="url" defaultValue={clinic.google_review_url ?? ""} placeholder="https://g.page/r/XXXXXXXX/review" /><span className="hint">Google Perfil de Empresa → «Pedir reseñas» → copiar link. Al terminar una reserva, el asistente invita al paciente a dejar su reseña (máximo una vez al mes por paciente).</span></label>
+                {admin && <div><Submit>Guardar link</Submit></div>}
               </fieldset>
             </ActionForm>
           </div>

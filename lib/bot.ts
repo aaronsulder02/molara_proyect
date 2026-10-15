@@ -2,8 +2,8 @@
 import { db } from "./supabase";
 import { wa, sendWa, markReadTyping, type WaAccount, type Row } from "./whatsapp";
 import { getAvailableDays, getSlots, listServices, getService } from "./availability";
-import { bookAppointment, setAppointmentStatus, upcomingForPatient, upsertPatient } from "./booking";
-import { humanDateTime, longDayLabel, shortDayLabel, ymdInTz, hmInTz } from "./time.ts";
+import { bookAppointment, setAppointmentStatus, upcomingForPatient, upsertPatient, samePhone, normalizePhone } from "./booking";
+import { humanDateTime, longDayLabel, shortDayLabel, ymdInTz, hmInTz, zonedToUtc, addDaysYmd } from "./time.ts";
 import { aiAvailable, runAgent, completeJson, type ChatMsg, type ToolDef } from "./ai";
 import { downloadWaMedia, transcribeAudio } from "./voice";
 import { parseEs, mergeFields, extractionPrompt, type FormStep, type Range } from "./nlu";
@@ -176,6 +176,8 @@ async function route(ctx: Ctx, id: string) {
     case "info": return showInfo(ctx);
     case "web": return sendWebLink(ctx);
     case "human": return handoff(ctx, "El paciente pidió hablar con recepción");
+    case "wlink": return linkWebBooking(ctx, a);
+    case "wkeep": return keepWebBooking(ctx, a);
     default: return sendMenu(ctx);
   }
 }
@@ -185,6 +187,9 @@ async function route(ctx: Ctx, id: string) {
    ════════════════════════════════════════════════════════════════════ */
 async function onText(ctx: Ctx, text: string, isNew: boolean) {
   const st = ctx.conv.state || {};
+
+  // "Hola, acabo de reservar … en la web": se verifica la reserva existente (nunca se busca disponibilidad)
+  if (await onWebBooking(ctx, text)) return;
 
   // Si el paciente está llenando el formulario de reserva, lo que escribe completa los campos
   if (st.step || st.awaiting === "name") {
@@ -367,6 +372,7 @@ async function doBook(ctx: Ctx) {
     dentistId: st.pending.dentistId,
     patient: { phone: ctx.to, full_name: ctx.patient?.full_name },
     channel: "whatsapp",
+    replacingId: st.rescheduleId,
   });
   if (!res.ok) {
     await ctx.send(wa.text(`😕 ${res.error}`));
@@ -383,7 +389,7 @@ async function doBook(ctx: Ctx) {
       [{ id: "mine", title: "🗓️ Mis citas" }, { id: "menu", title: "Menú principal" }],
       { footer: ctx.clinic.name }
     )
-  );
+  ).then(() => askReview(ctx));
 }
 
 async function showMine(ctx: Ctx) {
@@ -536,6 +542,7 @@ async function onVoice(ctx: Ctx, transcript: string, isNew: boolean) {
       [{ id: "book", title: "📅 Agendar hora" }, { id: "menu", title: "Menú principal" }]
     ));
   }
+  if (await onWebBooking(ctx, transcript)) return;
   if (await fillForm(ctx, transcript, "audio")) return;
   return onText(ctx, transcript, isNew);
 }
@@ -666,6 +673,150 @@ async function sendSlotList(ctx: Ctx, ymd: string, slots: { dentistId: string; d
 }
 
 /* ════════════════════════════════════════════════════════════════════
+   Reservas hechas en la agenda web → el paciente escribe por WhatsApp
+   ("Hola, acabo de reservar X para el <día> a las <hora>. Mi nombre es Y. Código de reserva: ABC123")
+   Se BUSCA la cita existente y se verifica el celular; nunca se consulta disponibilidad
+   (ese horario aparece "ocupado" justamente por la reserva del propio paciente).
+   ════════════════════════════════════════════════════════════════════ */
+const WEB_REF = /c[oó]digo(?:\s+de\s+reserva)?\s*[:#]?\s*([a-f0-9]{6})\b/i;
+
+export function looksLikeWebBooking(text: string) {
+  const t = norm(text);
+  return WEB_REF.test(text) || /(acabo de (reservar|agendar)|ya (reserve|agende)|reserve (en|por) (la web|la pagina|internet|el link)|reserva (web|online))/.test(t);
+}
+
+function nameFromMsg(text: string): string | undefined {
+  const m = text.match(/(?:mi nombre es|me llamo|soy)\s+([^\n.,;!?]{3,60})/i);
+  return m?.[1].trim() || undefined;
+}
+
+const nameWords = (s: string) => norm(s).split(/[^a-zñ]+/).filter((w) => w.length > 1);
+function sameName(a: string, b: string) {
+  const A = nameWords(a), B = nameWords(b);
+  if (!A.length || !B.length) return false;
+  const hits = A.filter((w) => B.includes(w)).length;
+  return hits >= Math.min(2, A.length, B.length);
+}
+
+async function findWebBooking(ctx: Ctx, text: string) {
+  const c = ctx.clinic;
+  const tz = c.timezone;
+  const ref = text.match(WEB_REF)?.[1]?.toLowerCase();
+  const clean = text.replace(WEB_REF, " ");
+  const services = await listServices(c.id);
+  const f = parseEs(clean, { today: ymdInTz(new Date(), tz), services });
+  const name = nameFromMsg(clean);
+
+  let q = db()
+    .from("appointments")
+    .select("id, starts_at, status, service_id, dentist:dentists(name), service:services(name), patient:patients(full_name, phone)")
+    .eq("clinic_id", c.id)
+    .in("status", ["pending", "confirmed"]);
+  if (f.ymd) q = q.gte("starts_at", zonedToUtc(f.ymd, "00:00", tz).toISOString()).lt("starts_at", zonedToUtc(addDaysYmd(f.ymd, 1), "00:00", tz).toISOString());
+  else q = q.gte("starts_at", new Date(Date.now() - 3600e3).toISOString()).lt("starts_at", new Date(Date.now() + 120 * 864e5).toISOString());
+  const { data } = await q.order("starts_at").limit(300);
+
+  // Identidad: código de la reserva, nombre o celular. El servicio solo desempata.
+  const score = (a: any) =>
+    (ref && String(a.id).startsWith(ref) ? 8 : 0) +
+    (name && sameName(name, a.patient?.full_name || "") ? 4 : 0) +
+    (samePhone(a.patient?.phone, ctx.to) ? 3 : 0) +
+    (f.serviceId && a.service_id === f.serviceId ? 1 : 0);
+  const best = (data ?? [])
+    .filter((a: any) => !f.hm || hmInTz(new Date(a.starts_at), tz) === f.hm)
+    .map((a: any) => ({ a, s: score(a) }))
+    .filter((x) => x.s >= 3)
+    .sort((x, y) => y.s - x.s)[0];
+  return { appt: best?.a as any, name };
+}
+
+async function onWebBooking(ctx: Ctx, text: string): Promise<boolean> {
+  if (!looksLikeWebBooking(text)) return false;
+  const st = ctx.conv.state || {};
+  if (st.step || st.pending || st.awaiting) await ctx.setState({ ...CLEAR_DRAFT, pending: undefined, awaiting: undefined });
+
+  const { appt, name } = await findWebBooking(ctx, text);
+  if (!appt) {
+    await ctx.send(wa.buttons(
+      `No encontré una reserva${name ? ` a nombre de *${titleCase(name)}*` : ""} con esos datos 🤔. Puede que el día u hora no coincidan con lo registrado. Te ayudo desde aquí:`,
+      [{ id: "mine", title: "🗓️ Mis citas" }, { id: "human", title: "💬 Recepción" }, { id: "book", title: "📅 Agendar hora" }],
+      { header: "Verificar reserva" }
+    ));
+    return true;
+  }
+
+  if (samePhone(appt.patient?.phone, ctx.to)) {
+    if (!ctx.patient?.full_name && appt.patient?.full_name) ctx.patient = await upsertPatient(ctx.clinic.id, ctx.to, { full_name: appt.patient.full_name });
+    await sendVerified(ctx, appt.id);
+    return true;
+  }
+
+  // El celular del formulario no es el de este chat → se pregunta antes de mover los avisos
+  const last4 = normalizePhone(appt.patient?.phone || "").slice(-4);
+  await ctx.setState({ webClaim: appt.id });
+  await ctx.send(wa.buttons(
+    `Encontré tu reserva 🙌\n\n🦷 *${appt.service?.name ?? "Atención"}*\n📅 ${humanDateTime(appt.starts_at, ctx.clinic.timezone)}\n\nPero quedó registrada con el celular terminado en *${last4}*, que no es el número de este chat. ¿Quieres que la confirmación y los recordatorios lleguen a este WhatsApp?`,
+    [{ id: `wlink:${appt.id}`, title: "Sí, a este número" }, { id: `wkeep:${appt.id}`, title: "No, dejarlo así" }],
+    { header: "Verificar reserva" }
+  ));
+  return true;
+}
+
+async function linkWebBooking(ctx: Ctx, id: string) {
+  // Solo si este chat acaba de identificar esa reserva (evita que se reclamen citas ajenas tocando un botón viejo)
+  if (ctx.conv.state?.webClaim !== id) return showMine(ctx);
+  const c = ctx.clinic;
+  const { data: a } = await db().from("appointments").select("id, patient:patients(full_name)").eq("clinic_id", c.id).eq("id", id).maybeSingle();
+  await ctx.setState({ webClaim: undefined });
+  if (!a) return showMine(ctx);
+  const owner: any = (a as any).patient;
+  const p = await upsertPatient(c.id, ctx.to, { full_name: ctx.patient?.full_name || owner?.full_name || null });
+  await db().from("appointments").update({ patient_id: p.id }).eq("clinic_id", c.id).eq("id", id);
+  ctx.patient = p;
+  return sendVerified(ctx, id, "Listo, desde ahora los avisos de esta cita llegarán a este WhatsApp 📲");
+}
+
+async function keepWebBooking(ctx: Ctx, id: string) {
+  if (ctx.conv.state?.webClaim !== id) return showMine(ctx);
+  await ctx.setState({ webClaim: undefined });
+  await ctx.send(wa.text("Perfecto 👌 Tu reserva queda tal cual y los recordatorios llegarán al celular que registraste en la web."));
+  return askReview(ctx);
+}
+
+async function sendVerified(ctx: Ctx, id: string, intro?: string) {
+  const { data: a } = await db()
+    .from("appointments")
+    .select("id, starts_at, status, dentist:dentists(name), service:services(name)")
+    .eq("clinic_id", ctx.clinic.id)
+    .eq("id", id)
+    .maybeSingle();
+  if (!a) return showMine(ctx);
+  const d: any = a;
+  const first = ctx.patient?.full_name?.split(" ")[0];
+  await ctx.send(wa.buttons(
+    `${intro ? intro + "\n\n" : ""}✅ ¡Listo${first ? `, ${first}` : ""}! Tu reserva está registrada en nuestra agenda:\n\n🦷 *${d.service?.name ?? "Atención"}*\n👩‍⚕️ ${d.dentist?.name ?? "Profesional"}\n📅 ${humanDateTime(d.starts_at, ctx.clinic.timezone)}${ctx.clinic.address ? `\n📍 ${ctx.clinic.address}` : ""}\n\nTe enviaré un recordatorio por este chat el día anterior. ¿Nos confirmas tu asistencia?`,
+    [{ id: `aok:${id}`, title: "✅ Confirmo" }, { id: `arb:${id}`, title: "🔄 Reagendar" }, { id: `acx:${id}`, title: "❌ Cancelar cita" }],
+    { header: "Reserva verificada" }
+  ));
+  return askReview(ctx);
+}
+
+/** Invita a dejar una reseña en Google (si el consultorio configuró el link), como máximo una vez cada 30 días por paciente. */
+async function askReview(ctx: Ctx) {
+  const url = String(ctx.clinic.google_review_url || "").trim();
+  if (!/^https:\/\/\S+$/.test(url)) return;
+  const last = ctx.conv.state?.reviewAskedAt;
+  if (last && Date.now() - Date.parse(last) < 30 * 864e5) return;
+  await ctx.setState({ reviewAskedAt: new Date().toISOString() });
+  await ctx.send(wa.cta(
+    "⭐ ¿Nos ayudas con una reseña en Google? Te toma un minuto y ayuda muchísimo a que más pacientes nos encuentren. ¡Gracias! 💙",
+    "Dejar reseña",
+    url,
+    { footer: ctx.clinic.name }
+  ));
+}
+
+/* ════════════════════════════════════════════════════════════════════
    Agente IA con herramientas (tool calling)
    ════════════════════════════════════════════════════════════════════ */
 async function agentReply(ctx: Ctx, isNew: boolean) {
@@ -673,6 +824,7 @@ async function agentReply(ctx: Ctx, isNew: boolean) {
   const tz = c.timezone;
   const now = new Date();
   const services = await listServices(c.id);
+  const mine = await upcomingForPatient(c.id, ctx.to).catch(() => [] as any[]);
 
   const { data: hist } = await db()
     .from("messages")
@@ -782,6 +934,7 @@ async function agentReply(ctx: Ctx, isNew: boolean) {
   const system = `Eres ${c.bot_name}, asistente virtual por WhatsApp de "${c.name}", un consultorio odontológico en ${c.city || "Chile"}.
 Hoy es ${longDayLabel(ymdInTz(now, tz))} y son las ${hmInTz(now, tz)} (zona ${tz}).
 Paciente: ${ctx.patient?.full_name || "(nombre aún desconocido)"} — teléfono ${ctx.to}.
+Próximas citas de este paciente: ${mine.length ? mine.map((a: any) => `${a.service?.name ?? "Atención"} con ${a.dentist?.name ?? "-"} el ${humanDateTime(a.starts_at, tz)} (${a.status === "confirmed" ? "confirmada" : "por confirmar"})`).join("; ") : "ninguna"}.
 
 DATOS DEL CONSULTORIO
 - Dirección: ${c.address || "no informada"} ${c.city || ""}
@@ -799,6 +952,7 @@ REGLAS
 5. Nunca des diagnósticos ni indicaciones médicas. Ante dolor intenso, sangrado, hinchazón o trauma: recomienda atención prioritaria y usa derivar_a_recepcion.
 6. Si una herramienta ya envió botones/lista, responde con texto vacío o una frase corta; no repitas las opciones.
 7. No hables de temas ajenos al consultorio.
+8. Si el paciente dice que YA reservó (por la web u otro canal), NO busques disponibilidad: ese horario figura ocupado justamente por su propia cita. Revisa sus próximas citas (arriba) y usa mis_citas; si no aparece, deriva a recepción.
 ${c.bot_instructions ? `\nINSTRUCCIONES DEL CONSULTORIO\n${c.bot_instructions}` : ""}`;
 
   if (isNew && !history.length) history.push({ role: "user", content: "Hola" });
