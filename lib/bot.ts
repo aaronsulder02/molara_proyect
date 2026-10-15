@@ -389,7 +389,7 @@ async function doBook(ctx: Ctx) {
       [{ id: "mine", title: "🗓️ Mis citas" }, { id: "menu", title: "Menú principal" }],
       { footer: ctx.clinic.name }
     )
-  ).then(() => askReview(ctx));
+  ).then(() => askFollow(ctx));
 }
 
 async function showMine(ctx: Ctx) {
@@ -780,7 +780,7 @@ async function keepWebBooking(ctx: Ctx, id: string) {
   if (ctx.conv.state?.webClaim !== id) return showMine(ctx);
   await ctx.setState({ webClaim: undefined });
   await ctx.send(wa.text("Perfecto 👌 Tu reserva queda tal cual y los recordatorios llegarán al celular que registraste en la web."));
-  return askReview(ctx);
+  return askFollow(ctx);
 }
 
 async function sendVerified(ctx: Ctx, id: string, intro?: string) {
@@ -798,22 +798,94 @@ async function sendVerified(ctx: Ctx, id: string, intro?: string) {
     [{ id: `aok:${id}`, title: "✅ Confirmo" }, { id: `arb:${id}`, title: "🔄 Reagendar" }, { id: `acx:${id}`, title: "❌ Cancelar cita" }],
     { header: "Reserva verificada" }
   ));
-  return askReview(ctx);
+  return askFollow(ctx);
 }
 
-/** Invita a dejar una reseña en Google (si el consultorio configuró el link), como máximo una vez cada 30 días por paciente. */
-async function askReview(ctx: Ctx) {
-  const url = String(ctx.clinic.google_review_url || "").trim();
-  if (!/^https:\/\/\S+$/.test(url)) return;
-  const last = ctx.conv.state?.reviewAskedAt;
-  if (last && Date.now() - Date.parse(last) < 30 * 864e5) return;
-  await ctx.setState({ reviewAskedAt: new Date().toISOString() });
-  await ctx.send(wa.cta(
-    "⭐ ¿Nos ayudas con una reseña en Google? Te toma un minuto y ayuda muchísimo a que más pacientes nos encuentren. ¡Gracias! 💙",
-    "Dejar reseña",
-    url,
-    { footer: ctx.clinic.name }
-  ));
+/** Cuenta de Instagram del consultorio: la configurada en Ajustes o la conectada en «Instagram». */
+async function instagramHandle(clinic: any): Promise<string | null> {
+  const own = cleanHandle(clinic.instagram_handle);
+  if (own) return own;
+  const { data } = await db().from("instagram_accounts").select("username").eq("clinic_id", clinic.id).maybeSingle();
+  return cleanHandle(data?.username);
+}
+export function cleanHandle(raw?: string | null): string | null {
+  const m = String(raw || "").trim().match(/^(?:https?:\/\/)?(?:www\.)?(?:instagram\.com\/)?@?([A-Za-z0-9._]{1,30})\/?(?:\?.*)?$/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Al cerrar una reserva el paciente sigue en línea: se le invita a seguir el Instagram del consultorio.
+ * Hook: beneficio concreto ("regalo") + exclusividad (promos solo para seguidores) + acción de 1 toque.
+ * Máximo una vez cada 90 días por paciente.
+ */
+async function askFollow(ctx: Ctx) {
+  const handle = await instagramHandle(ctx.clinic);
+  if (!handle) return;
+  const last = ctx.conv.state?.igAskedAt;
+  if (last && Date.now() - Date.parse(last) < 90 * 864e5) return;
+  await ctx.setState({ igAskedAt: new Date().toISOString() });
+  const first = ctx.patient?.full_name?.split(" ")[0];
+  const perk = String(ctx.clinic.instagram_perk || "").trim();
+  const body = perk
+    ? `🎁 *¡Un regalo antes de irte${first ? `, ${first}` : ""}!*\n\nSíguenos en Instagram y llévate: *${perk}*. Solo muestra en recepción que nos sigues el día de tu cita 😉\n\nAdemás, ahí publicamos *primero* las promociones exclusivas para seguidores y tips para cuidar tu sonrisa.`
+    : `📸 *¿Ya nos sigues${first ? `, ${first}` : ""}?*\n\nEn Instagram publicamos *primero* las promociones exclusivas para seguidores, tips para cuidar tu sonrisa y novedades del consultorio.\n\nSíguenos y entérate antes que nadie 👇`;
+  await ctx.send(wa.cta(body, perk ? "Seguir y ganar 🎁" : "Seguir en Instagram", `https://www.instagram.com/${handle}/`, { footer: `@${handle}` }));
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   Reseña en Google al día siguiente de la cita (cron diario)
+   Dentro de las 24 h desde el último mensaje del paciente se envía un botón; fuera de esa
+   ventana Meta exige plantilla aprobada (Ajustes → «Plantilla de reseña»), si no, se omite.
+   ════════════════════════════════════════════════════════════════════ */
+export const reviewText = (first: string | null | undefined, clinic: string, service?: string | null) =>
+  `¡Hola${first ? ` ${first}` : ""}! 😊 Gracias por visitarnos ayer en *${clinic}*.\n\n¿Cómo te sentiste con tu ${service ? `*${service}*` : "atención"}? Si te atendimos bien, una reseña en Google nos ayuda muchísimo a que más personas nos encuentren ⭐ Te toma solo un minuto.`;
+
+export async function sendReviewRequestsForClinic(clinic: any, acc: WaAccount) {
+  const url = String(clinic.google_review_url || "").trim();
+  if (!/^https:\/\/\S+$/.test(url)) return { total: 0, sent: 0, skipped: 0, failed: 0 };
+  const tz = clinic.timezone;
+  const yesterday = ymdInTz(new Date(Date.now() - 24 * 3600 * 1000), tz);
+  const { data: appts } = await db()
+    .from("appointments")
+    .select("id, starts_at, status, patient_id, service:services(name), patient:patients(full_name, phone)")
+    .eq("clinic_id", clinic.id)
+    .in("status", ["pending", "confirmed", "completed"])
+    .gte("starts_at", zonedToUtc(yesterday, "00:00", tz).toISOString())
+    .lt("starts_at", zonedToUtc(addDaysYmd(yesterday, 1), "00:00", tz).toISOString())
+    .is("review_requested_at", null);
+
+  let sent = 0, skipped = 0, failed = 0;
+  const seen = new Set<string>();
+  for (const a of (appts ?? []) as any[]) {
+    const phone = a.patient?.phone;
+    if (!phone || seen.has(a.patient_id)) { skipped++; continue; }
+    seen.add(a.patient_id);
+    const { data: conv } = await db().from("conversations").select("id, state, last_inbound_at").eq("clinic_id", clinic.id).eq("wa_id", phone).maybeSingle();
+    const st = conv?.state || {};
+    if (st.reviewAskedAt && Date.now() - Date.parse(st.reviewAskedAt) < 30 * 864e5) { skipped++; continue; }
+    const first = a.patient?.full_name?.split(" ")[0] || null;
+    const windowOpen = conv?.last_inbound_at && Date.now() - new Date(conv.last_inbound_at).getTime() < 23.5 * 3600 * 1000;
+    let payload: any = null;
+    if (windowOpen) payload = wa.cta(reviewText(first, clinic.name, a.service?.name), "Dejar reseña ⭐", url, { footer: clinic.name });
+    else if (clinic.review_template) {
+      // Plantilla: {{1}} nombre, {{2}} consultorio. El botón URL (link de reseña) se define en la plantilla en Meta.
+      payload = wa.template(clinic.review_template, clinic.review_template_lang || "es", [
+        { type: "body", parameters: [{ type: "text", text: first || "paciente" }, { type: "text", text: clinic.name }] },
+      ]);
+    }
+    if (!payload) { skipped++; continue; }
+    let convId = conv?.id;
+    if (!convId) {
+      const { data: created } = await db().from("conversations").insert({ clinic_id: clinic.id, wa_id: phone, profile_name: a.patient?.full_name }).select("id").single();
+      convId = created?.id;
+    }
+    const r = await sendWa(acc, phone, payload, { conversationId: convId, author: "system" });
+    if (!r.ok) { failed++; continue; }
+    sent++;
+    await db().from("appointments").update({ review_requested_at: new Date().toISOString() }).eq("id", a.id);
+    await db().from("conversations").update({ state: { ...st, reviewAskedAt: new Date().toISOString() } }).eq("id", convId);
+  }
+  return { total: appts?.length ?? 0, sent, skipped, failed };
 }
 
 /* ════════════════════════════════════════════════════════════════════
