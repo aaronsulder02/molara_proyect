@@ -1,5 +1,5 @@
-// E2E con navegador real: Ajustes (link de reseñas) → reserva en /reservar → mensaje prellenado de WhatsApp
-// entregado al webhook firmado (Meta simulado) → el bot verifica la reserva y envía la reseña.
+// E2E con navegador real: Ajustes (reseñas + Instagram) → reserva en /reservar → mensaje prellenado de WhatsApp
+// entregado al webhook firmado (Meta simulado) → el bot verifica la reserva e invita a seguir el Instagram.
 // Requiere el mismo entorno que metaConnect.e2e.ts (fakeSupabase, fakeMeta y `next start -p 3100`).
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
@@ -41,15 +41,20 @@ const REVIEW = "https://g.page/r/MOLARA-DEMO/review";
     const clinicId = acc.clinic_id;
     ok("Consultorio registrado y WhatsApp conectado");
 
-    // 2) Ajustes: link de reseñas (validación + guardado)
+    // 2) Ajustes → «Reseñas e Instagram» (validación + guardado)
     await page.goto(APP + "/panel/ajustes");
     const clinicForm = page.locator("form", { has: page.locator("[name=google_review_url]") });
+    await page.fill("[name=instagram_handle]", "esto no es un usuario!");
+    await clinicForm.locator("button[type=submit]").click();
+    await clinicForm.locator(".alert-err").first().waitFor({ timeout: 15000 });
+    await page.fill("[name=instagram_handle]", "https://www.instagram.com/drgregorio.dental/");
+    await page.fill("[name=instagram_perk]", "Blanqueamiento con 15% de descuento");
     await page.fill("[name=google_review_url]", REVIEW);
     await clinicForm.locator("button[type=submit]").click();
     await clinicForm.locator(".alert-ok").first().waitFor({ timeout: 15000 });
-    const { rows: [cl] } = await pool.query("select slug, google_review_url, timezone from clinics where id=$1", [clinicId]);
-    assert.equal(cl.google_review_url, REVIEW);
-    ok("Ajustes → «Link para reseñas en Google» guardado");
+    const { rows: [cl] } = await pool.query("select slug, google_review_url, instagram_handle, instagram_perk, timezone from clinics where id=$1", [clinicId]);
+    assert.equal(cl.google_review_url, REVIEW); assert.equal(cl.instagram_handle, "drgregorio.dental"); assert.equal(cl.instagram_perk, "Blanqueamiento con 15% de descuento");
+    ok("Ajustes → «Reseñas e Instagram»: valida el usuario, normaliza el link del perfil y guarda el beneficio");
 
     // Agenda: un servicio y horario todos los días (por si el registro no los crea)
     const { rows: [svc] } = await pool.query(`insert into services(clinic_id, name, duration_min, price, sort) values ($1,'Evaluación odontológica',30,15000,0) returning id`, [clinicId]);
@@ -86,8 +91,9 @@ const REVIEW = "https://g.page/r/MOLARA-DEMO/review";
     assert.equal(out[0].interactive.header.text, "Reserva verificada", body(out[0]));
     assert.ok(!/no hay horarios/i.test(body(out[0])));
     assert.match(body(out[0]), /Salomon/); assert.match(body(out[0]), /Evaluación odontológica/);
-    assert.equal(out[1].interactive.type, "cta_url"); assert.equal(out[1].interactive.action.parameters.url, REVIEW);
-    ok("Webhook real → «Reserva verificada» con botones Confirmo/Reagendar/Cancelar + «Dejar reseña»");
+    assert.equal(out[1].interactive.type, "cta_url"); assert.equal(out[1].interactive.action.parameters.url, "https://www.instagram.com/drgregorio.dental/");
+    assert.match(body(out[1]), /Blanqueamiento con 15% de descuento/);
+    ok("Webhook real → «Reserva verificada» con botones Confirmo/Reagendar/Cancelar + «Seguir y ganar 🎁» en Instagram");
     console.log("\nFlujo web → WhatsApp con navegador: OK");
   } catch (e) {
     console.error("✘ FALLÓ:", e);
