@@ -71,7 +71,8 @@ export function BookingWizard({ slug, services, dentists, clinicName, address, w
     const start = new Date(slot.start); const end = new Date(slot.end);
     const g = (d: Date) => d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
     const gcal = `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(`${service.name} · ${clinicName}`)}&dates=${g(start)}/${g(end)}&location=${encodeURIComponent(address ?? "")}&details=${encodeURIComponent(`Con ${slot.dentistName}`)}`;
-    const waText = encodeURIComponent(`Hola, acabo de reservar ${service.name} para el ${fmtTime(slot.start)}. Mi nombre es ${form.name}.`);
+    const code = String(done?.appointment?.id ?? "").slice(0, 6).toUpperCase();
+    const waText = encodeURIComponent(`Hola, acabo de reservar ${service.name} para el ${fmtTime(slot.start)}. Mi nombre es ${form.name.trim()}.${code ? ` Código de reserva: ${code}` : ""}`);
     return (
       <div className="card card-pad stack" style={{ textAlign: "center", padding: 40 }}>
         <div style={{ width: 64, height: 64, borderRadius: "50%", background: "var(--mint)", color: "var(--teal-700)", display: "grid", placeItems: "center", margin: "0 auto" }}><Icon name="check" size={32} stroke={2.6} /></div>

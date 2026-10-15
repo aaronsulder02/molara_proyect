@@ -11,6 +11,13 @@ export function normalizePhone(raw: string): string {
   return p;
 }
 
+/** Mismo celular aunque uno venga con código de país y el otro no (compara los últimos 8 dígitos). */
+export function samePhone(a?: string | null, b?: string | null): boolean {
+  const x = normalizePhone(a || ""), y = normalizePhone(b || "");
+  if (x.length < 8 || y.length < 8) return false;
+  return x === y || x.slice(-8) === y.slice(-8);
+}
+
 export async function upsertPatient(clinicId: string, phone: string, patch: { full_name?: string | null; email?: string | null; rut?: string | null }) {
   const clean = normalizePhone(phone);
   const { data: existing } = await db().from("patients").select("*").eq("clinic_id", clinicId).eq("phone", clean).maybeSingle();
@@ -46,6 +53,8 @@ export type BookInput = {
   status?: "pending" | "confirmed";
   /** Omite la validación contra horarios de atención (reservas manuales desde el panel) */
   force?: boolean;
+  /** Cita que se está reagendando: no cuenta como cruce con la nueva hora */
+  replacingId?: string | null;
 };
 
 export type BookResult = { ok: boolean; appointment?: any; error?: string };
@@ -68,6 +77,18 @@ export async function bookAppointment(inp: BookInput): Promise<BookResult> {
   if (!dentistId) return { ok: false, error: "Selecciona un profesional." };
 
   const patient = await upsertPatient(inp.clinic.id, inp.patient.phone, inp.patient);
+
+  // Un mismo paciente no puede tener dos horas que se crucen (aunque sean con profesionales distintos)
+  const { data: clash } = await db()
+    .from("appointments")
+    .select("id")
+    .eq("clinic_id", inp.clinic.id)
+    .eq("patient_id", patient.id)
+    .in("status", ["pending", "confirmed"])
+    .lt("starts_at", end.toISOString())
+    .gt("ends_at", start.toISOString())
+    .limit(2);
+  if (!inp.force && clash?.some((c: any) => c.id !== inp.replacingId)) return { ok: false, error: "Ya tienes una hora reservada que se cruza con ese horario. Revisa tus citas o elige otro horario." };
 
   const { data, error } = await db()
     .from("appointments")
