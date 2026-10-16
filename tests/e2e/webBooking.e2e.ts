@@ -18,11 +18,13 @@ const pool = DB.pool;
 const sent: any[] = [];
 const aiCalls: any[] = [];
 let aiScript: any[] = [];
+const failTo = new Set<string>(); // números a los que Meta "rechaza" el envío (p. ej. plantilla aún en revisión)
 globalThis.fetch = (async (url: any, init?: any) => {
   const u = String(url);
   if (u.includes("graph.facebook.com")) {
     const body = init?.body ? JSON.parse(init.body) : {};
     if (body.status === "read") return new Response(JSON.stringify({ success: true }));
+    if (failTo.has(body.to)) return new Response(JSON.stringify({ error: { message: "(#132001) Template name does not exist in the translation", code: 132001 } }), { status: 404 });
     sent.push(body);
     return new Response(JSON.stringify({ messages: [{ id: "wamid.o" + Math.random().toString(36).slice(2) }] }));
   }
@@ -220,13 +222,13 @@ async function main() {
   await pool.query(`update clinics set google_review_url=$2 where id=$1`, [clinic.id, REVIEW]);
   const { rows: [cl2] } = await pool.query(`select * from clinics where id=$1`, [clinic.id]);
   const yday = addDaysYmd(ymdInTz(new Date(), tz), -1);
-  const past = async (phone: string, name: string, hm: string, status = "confirmed", dentistId = g.id) => {
+  const past = async (phone: string, name: string, hm: string, status = "confirmed", dentistId = g.id, ymd = yday) => {
     const { rows: [p] } = await pool.query(`insert into patients(clinic_id, phone, full_name) values ($1,$2,$3) on conflict (clinic_id, phone) do update set full_name=excluded.full_name returning id`, [clinic.id, phone, name]);
-    const { rows: [a] } = await pool.query(`insert into appointments(clinic_id, patient_id, dentist_id, service_id, starts_at, ends_at, status, channel) values ($1,$2,$3,$4,($5::date + $6::time) at time zone $7, ($5::date + $6::time + interval '30 min') at time zone $7, $8, 'web') returning id`, [clinic.id, p.id, dentistId, EVAL.id, yday, hm, tz, status]);
+    const { rows: [a] } = await pool.query(`insert into appointments(clinic_id, patient_id, dentist_id, service_id, starts_at, ends_at, status, channel) values ($1,$2,$3,$4,($5::date + $6::time) at time zone $7, ($5::date + $6::time + interval '30 min') at time zone $7, $8, 'web') returning id`, [clinic.id, p.id, dentistId, EVAL.id, ymd, hm, tz, status]);
     return a.id;
   };
   const R1 = "56910101010", R2 = "56920202020", R3 = "56930303030";
-  const r1 = await past(R1, "Marta Ríos", "10:00");                     // escribió hace poco → ventana abierta
+  const r1 = await past(R1, "  marta   ríos ", "10:00");                     // escribió hace poco → ventana abierta
   await pool.query(`insert into conversations(clinic_id, wa_id, last_inbound_at) values ($1,$2, now() - interval '3 hours')`, [clinic.id, R1]);
   await past(R2, "Hugo Vera", "11:00");                                  // sin ventana y sin plantilla → se omite
   await past(R3, "Inés Toro", "12:00", "cancelled");                      // cancelada → nunca
@@ -250,6 +252,26 @@ async function main() {
   assert.equal(rv.sent, 1); assert.equal(tpl.to, R2); assert.equal(tpl.type, "template"); assert.equal(tpl.template.name, "resena_google");
   assert.deepEqual(tpl.template.components[0].parameters.map((x: any) => x.text), ["Hugo", "Evaluación odontológica", "Dr Gregorio"]);
   ok("Fuera de la ventana de 24 h → usa la plantilla aprobada; nunca repite al mismo paciente");
+
+  /* ═══ 13) Robustez: reintentos, citas antiguas y variables limpias ═══ */
+  const R4 = "56940404040", R5 = "56950505050";
+  const r4 = await past(R4, "Rosa\nPinto", "15:00", "completed", g.id, addDaysYmd(yday, -1)); // atendida anteayer, nombre con salto de línea
+  await past(R5, "Old Patient", "15:00", "confirmed", g.id, addDaysYmd(yday, -4));             // hace 5 días → fuera de la ventana de reintentos
+  failTo.add(R4);                                                                                 // Meta rechaza (plantilla en revisión)
+  rv = await sendReviewRequestsForClinic(cl3, acc);
+  assert.equal(rv.failed, 1); assert.equal(rv.sent, 0);
+  const { rows: [r4a] } = await pool.query(`select review_requested_at from appointments where id=$1`, [r4]);
+  assert.equal(r4a.review_requested_at, null, "si falla, la cita queda pendiente para reintentar");
+  failTo.clear();
+  const b3 = sent.length;
+  rv = await sendReviewRequestsForClinic(cl3, acc);
+  assert.equal(rv.sent, 1, "al día siguiente se reintenta y llega");
+  const retry = sent.slice(b3)[0];
+  assert.equal(retry.to, R4); assert.deepEqual(retry.template.components[0].parameters.map((x: any) => x.text), ["Rosa", "Evaluación odontológica", "Dr Gregorio"]);
+  assert.ok(!sent.some((x) => x.to === R5), "citas de hace más de 3 días no se tocan");
+  rv = await sendReviewRequestsForClinic(cl3, acc);
+  assert.equal(rv.sent, 0);
+  ok("Si Meta rechaza (p. ej. plantilla en revisión) se reintenta hasta 3 días; variables sin saltos de línea; nunca duplica");
 
   console.log(`\nReservas web ↔ WhatsApp: todos los escenarios OK · ${sent.length} mensajes validados contra los límites de Meta.`);
   await pool.end();

@@ -4,7 +4,7 @@ import { Submit } from "@/components/Submit";
 import { aiAvailable } from "@/lib/ai";
 import { db } from "@/lib/supabase";
 import { changePassword, saveBot, saveClinic } from "../actions";
-import { saveReviewLink } from "./reviewAction";
+import { saveReviewLink, sendReviewTest } from "./reviewAction";
 
 export const metadata = { title: "Ajustes" };
 
@@ -100,6 +100,15 @@ export default async function Ajustes() {
                 {admin && <div><Submit>Guardar fidelización</Submit></div>}
               </fieldset>
             </ActionForm>
+            {admin && clinic.review_template && (
+              <ActionForm action={sendReviewTest} className="card-pad form-grid" >
+                <div className="form-row">
+                  <label className="field"><span>Probar plantilla en mi WhatsApp</span><input className="input" name="test_phone" placeholder="+56 9 1234 5678" inputMode="tel" required /></label>
+                  <label className="field"><span>Nombre de ejemplo</span><input className="input" name="test_name" defaultValue="Camila" /></label>
+                </div>
+                <div><Submit className="btn">Enviar prueba</Submit></div>
+              </ActionForm>
+            )}
           </div>
 
           <div className="card">
