@@ -235,7 +235,7 @@ async function main() {
   const msgs = sent.slice(before);
   assert.deepEqual({ sent: rv.sent, skipped: rv.skipped }, { sent: 1, skipped: 1 });
   assert.equal(msgs[0].to, R1); assert.equal(msgs[0].interactive.action.parameters.url, REVIEW);
-  assert.match(bodyOf(msgs[0]), /Gracias por visitarnos ayer en \*Dr Gregorio\*/); assert.match(bodyOf(msgs[0]), /Evaluación odontológica/);
+  assert.match(bodyOf(msgs[0]), /Hola Marta/); assert.match(bodyOf(msgs[0]), /felicitarte por tu \*Evaluación odontológica\*/); assert.match(bodyOf(msgs[0]), /\*Dr Gregorio\*/);
   const { rows: [rr] } = await pool.query(`select review_requested_at from appointments where id=$1`, [r1]);
   assert.ok(rr.review_requested_at);
   ok("Día siguiente: reseña con botón a quien tiene la ventana de 24 h abierta; cancelada excluida");
@@ -248,7 +248,7 @@ async function main() {
   rv = await sendReviewRequestsForClinic(cl3, acc);
   const tpl = sent.slice(b2)[0];
   assert.equal(rv.sent, 1); assert.equal(tpl.to, R2); assert.equal(tpl.type, "template"); assert.equal(tpl.template.name, "resena_google");
-  assert.deepEqual(tpl.template.components[0].parameters.map((x: any) => x.text), ["Hugo", "Dr Gregorio"]);
+  assert.deepEqual(tpl.template.components[0].parameters.map((x: any) => x.text), ["Hugo", "Evaluación odontológica", "Dr Gregorio"]);
   ok("Fuera de la ventana de 24 h → usa la plantilla aprobada; nunca repite al mismo paciente");
 
   console.log(`\nReservas web ↔ WhatsApp: todos los escenarios OK · ${sent.length} mensajes validados contra los límites de Meta.`);
