@@ -50,6 +50,7 @@ const REVIEW = "https://g.page/r/MOLARA-DEMO/review";
     await page.fill("[name=instagram_handle]", "https://www.instagram.com/drgregorio.dental/");
     await page.fill("[name=instagram_perk]", "Blanqueamiento con 15% de descuento");
     await page.fill("[name=google_review_url]", REVIEW);
+    await page.fill("[name=review_template]", "resena_google_v3");
     await clinicForm.locator("button[type=submit]").click();
     await clinicForm.locator(".alert-ok").first().waitFor({ timeout: 15000 });
     const { rows: [cl] } = await pool.query("select slug, google_review_url, instagram_handle, instagram_perk, timezone from clinics where id=$1", [clinicId]);
@@ -61,6 +62,20 @@ const REVIEW = "https://g.page/r/MOLARA-DEMO/review";
     const { rows: [den] } = await pool.query(`insert into dentists(clinic_id, name) values ($1,'Dr. Gregorio Paz') returning id`, [clinicId]);
     for (let wd = 0; wd < 7; wd++) await pool.query(`insert into schedules(clinic_id, dentist_id, weekday, start_time, end_time) values ($1,$2,$3,'09:00','18:00')`, [clinicId, den.id, wd]);
     await pool.query(`update services set active=false where clinic_id=$1 and id<>$2`, [clinicId, svc.id]).catch(() => null);
+
+    // 2b) «Enviar prueba» de la plantilla de reseña → llega a Meta con las 3 variables
+    await page.goto(APP + "/panel/ajustes");
+    const testForm = page.locator("form", { has: page.locator("[name=test_phone]") });
+    await page.fill("[name=test_phone]", "+56 9 8888 7777");
+    await page.fill("[name=test_name]", "  valentina  ");
+    const sentBefore = (await meta("/__state")).sent.length;
+    await testForm.locator("button[type=submit]").click();
+    await testForm.locator(".alert-ok").first().waitFor({ timeout: 15000 });
+    const tpl = (await meta("/__state")).sent.slice(sentBefore)[0];
+    assert.equal(tpl.to, "56988887777"); assert.equal(tpl.type, "template"); assert.equal(tpl.template.name, "resena_google_v3"); assert.equal(tpl.template.language.code, "es");
+    const vars = tpl.template.components[0].parameters.map((x: any) => x.text);
+    assert.equal(vars[0], "Valentina"); assert.equal(vars[2], "Dr Gregorio Web"); assert.ok(vars[1].length > 0);
+    ok(`Ajustes → «Enviar prueba»: plantilla resena_google_v3 con variables ${JSON.stringify(vars)}`);
 
     // 3) Reserva en la página pública
     await page.goto(`${APP}/reservar/${cl.slug}`);
