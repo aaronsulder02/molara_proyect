@@ -838,7 +838,7 @@ async function askFollow(ctx: Ctx) {
    ventana Meta exige plantilla aprobada (Ajustes → «Plantilla de reseña»), si no, se omite.
    ════════════════════════════════════════════════════════════════════ */
 export const reviewText = (first: string | null | undefined, clinic: string, service?: string | null) =>
-  `¡Hola${first ? ` ${first}` : ""}! 😊 Gracias por visitarnos ayer en *${clinic}*.\n\n¿Cómo te sentiste con tu ${service ? `*${service}*` : "atención"}? Si te atendimos bien, una reseña en Google nos ayuda muchísimo a que más personas nos encuentren ⭐ Te toma solo un minuto.`;
+  `¡Hola${first ? ` ${first}` : ""}! 🦷✨\n\nQueremos felicitarte por tu ${service ? `*${service}*` : "atención"}: cuidar tu salud bucal es una de las mejores decisiones que puedes tomar, y nos alegra haber sido parte de ella.\n\nSeguimos aquí para ti. Ante cualquier duda, molestia o urgencia, este chat está abierto y te responderemos con gusto.\n\nSi quedaste a gusto con la atención, te pedimos algo muy valioso: cuéntalo en Google. Tu reseña es lo que anima a otra persona a confiar su sonrisa a *${clinic}* ⭐`;
 
 export async function sendReviewRequestsForClinic(clinic: any, acc: WaAccount) {
   const url = String(clinic.google_review_url || "").trim();
@@ -868,9 +868,9 @@ export async function sendReviewRequestsForClinic(clinic: any, acc: WaAccount) {
     let payload: any = null;
     if (windowOpen) payload = wa.cta(reviewText(first, clinic.name, a.service?.name), "Dejar reseña ⭐", url, { footer: clinic.name });
     else if (clinic.review_template) {
-      // Plantilla: {{1}} nombre, {{2}} consultorio. El botón URL (link de reseña) se define en la plantilla en Meta.
+      // Plantilla: {{1}} nombre, {{2}} servicio, {{3}} consultorio. El botón URL (link de reseña) se define en la plantilla en Meta.
       payload = wa.template(clinic.review_template, clinic.review_template_lang || "es", [
-        { type: "body", parameters: [{ type: "text", text: first || "paciente" }, { type: "text", text: clinic.name }] },
+        { type: "body", parameters: [{ type: "text", text: first || "paciente" }, { type: "text", text: a.service?.name || "atención" }, { type: "text", text: clinic.name }] },
       ]);
     }
     if (!payload) { skipped++; continue; }
