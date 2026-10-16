@@ -96,7 +96,7 @@ export default async function Ajustes() {
                   <label className="field"><span>Plantilla de reseña (Meta)</span><input className="input mono" name="review_template" defaultValue={clinic.review_template ?? ""} placeholder="resena_google" /></label>
                   <label className="field"><span>Idioma</span><input className="input mono" name="review_template_lang" defaultValue={clinic.review_template_lang ?? "es"} /></label>
                 </div>
-                <span className="hint" style={{ marginTop: -6 }}>Sin plantilla aprobada, la reseña solo llega a quienes escribieron en las últimas 24 h (regla de WhatsApp). Cuerpo: {"{{1}}"} nombre, {"{{2}}"} consultorio + botón con tu link de reseña.</span>
+                <span className="hint" style={{ marginTop: -6 }}>Sin plantilla aprobada, la reseña solo llega a quienes escribieron en las últimas 24 h (regla de WhatsApp). Variables: {"{{1}}"} nombre, {"{{2}}"} servicio, {"{{3}}"} consultorio + botón con tu link de reseña.</span>
                 {admin && <div><Submit>Guardar fidelización</Submit></div>}
               </fieldset>
             </ActionForm>
