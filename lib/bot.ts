@@ -840,19 +840,45 @@ async function askFollow(ctx: Ctx) {
 export const reviewText = (first: string | null | undefined, clinic: string, service?: string | null) =>
   `¡Hola${first ? ` ${first}` : ""}! 🦷✨\n\nQueremos felicitarte por tu ${service ? `*${service}*` : "atención"}: cuidar tu salud bucal es una de las mejores decisiones que puedes tomar, y nos alegra haber sido parte de ella.\n\nSeguimos aquí para ti. Ante cualquier duda, molestia o urgencia, este chat está abierto y te responderemos con gusto.\n\nSi quedaste a gusto con la atención, te pedimos algo muy valioso: cuéntalo en Google. Tu reseña es lo que anima a otra persona a confiar su sonrisa a *${clinic}* ⭐`;
 
+/** Texto seguro para variables de plantilla: Meta rechaza vacíos, saltos de línea, tabs y 4+ espacios seguidos. */
+const tplVar = (v: string | null | undefined, fallback: string) => {
+  const t = String(v ?? "").replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim().slice(0, 60);
+  return t || fallback;
+};
+const firstName = (full?: string | null) => {
+  const f = String(full || "").trim().split(/\s+/)[0] || "";
+  return f ? f.charAt(0).toUpperCase() + f.slice(1).toLowerCase() : null;
+};
+
+/** Plantilla aprobada en Meta: {{1}} nombre, {{2}} servicio, {{3}} consultorio (el botón con el link de reseña vive en la plantilla). */
+export function reviewTemplatePayload(clinic: any, patientName: string | null | undefined, service: string | null | undefined) {
+  return wa.template(String(clinic.review_template).trim(), String(clinic.review_template_lang || "es").trim(), [
+    { type: "body", parameters: [
+      { type: "text", text: tplVar(firstName(patientName), "paciente") },
+      { type: "text", text: tplVar(service, "atención") },
+      { type: "text", text: tplVar(clinic.name, "nuestro consultorio") },
+    ] },
+  ]);
+}
+
+/**
+ * Pide la reseña a los pacientes atendidos en los últimos 3 días (sin contar hoy) a los que aún no se les pidió.
+ * Si un envío falla (plantilla en revisión, sin conexión, etc.) la cita queda pendiente y se reintenta al día siguiente.
+ */
 export async function sendReviewRequestsForClinic(clinic: any, acc: WaAccount) {
   const url = String(clinic.google_review_url || "").trim();
   if (!/^https:\/\/\S+$/.test(url)) return { total: 0, sent: 0, skipped: 0, failed: 0 };
   const tz = clinic.timezone;
-  const yesterday = ymdInTz(new Date(Date.now() - 24 * 3600 * 1000), tz);
+  const today = ymdInTz(new Date(), tz);
   const { data: appts } = await db()
     .from("appointments")
     .select("id, starts_at, status, patient_id, service:services(name), patient:patients(full_name, phone)")
     .eq("clinic_id", clinic.id)
     .in("status", ["pending", "confirmed", "completed"])
-    .gte("starts_at", zonedToUtc(yesterday, "00:00", tz).toISOString())
-    .lt("starts_at", zonedToUtc(addDaysYmd(yesterday, 1), "00:00", tz).toISOString())
-    .is("review_requested_at", null);
+    .gte("starts_at", zonedToUtc(addDaysYmd(today, -3), "00:00", tz).toISOString())
+    .lt("starts_at", zonedToUtc(today, "00:00", tz).toISOString())
+    .is("review_requested_at", null)
+    .order("starts_at", { ascending: false });
 
   let sent = 0, skipped = 0, failed = 0;
   const seen = new Set<string>();
@@ -862,17 +888,15 @@ export async function sendReviewRequestsForClinic(clinic: any, acc: WaAccount) {
     seen.add(a.patient_id);
     const { data: conv } = await db().from("conversations").select("id, state, last_inbound_at").eq("clinic_id", clinic.id).eq("wa_id", phone).maybeSingle();
     const st = conv?.state || {};
-    if (st.reviewAskedAt && Date.now() - Date.parse(st.reviewAskedAt) < 30 * 864e5) { skipped++; continue; }
-    const first = a.patient?.full_name?.split(" ")[0] || null;
+    if (st.reviewAskedAt && Date.now() - Date.parse(st.reviewAskedAt) < 30 * 864e5) {
+      // Ya se le pidió hace poco (por otra cita): esta queda marcada para no volver a intentarlo
+      await db().from("appointments").update({ review_requested_at: st.reviewAskedAt }).eq("id", a.id);
+      skipped++; continue;
+    }
     const windowOpen = conv?.last_inbound_at && Date.now() - new Date(conv.last_inbound_at).getTime() < 23.5 * 3600 * 1000;
     let payload: any = null;
-    if (windowOpen) payload = wa.cta(reviewText(first, clinic.name, a.service?.name), "Dejar reseña ⭐", url, { footer: clinic.name });
-    else if (clinic.review_template) {
-      // Plantilla: {{1}} nombre, {{2}} servicio, {{3}} consultorio. El botón URL (link de reseña) se define en la plantilla en Meta.
-      payload = wa.template(clinic.review_template, clinic.review_template_lang || "es", [
-        { type: "body", parameters: [{ type: "text", text: first || "paciente" }, { type: "text", text: a.service?.name || "atención" }, { type: "text", text: clinic.name }] },
-      ]);
-    }
+    if (windowOpen) payload = wa.cta(reviewText(firstName(a.patient?.full_name), clinic.name, a.service?.name), "Dejar reseña ⭐", url, { footer: clinic.name });
+    else if (clinic.review_template) payload = reviewTemplatePayload(clinic, a.patient?.full_name, a.service?.name);
     if (!payload) { skipped++; continue; }
     let convId = conv?.id;
     if (!convId) {
@@ -880,10 +904,11 @@ export async function sendReviewRequestsForClinic(clinic: any, acc: WaAccount) {
       convId = created?.id;
     }
     const r = await sendWa(acc, phone, payload, { conversationId: convId, author: "system" });
-    if (!r.ok) { failed++; continue; }
+    if (!r.ok) { failed++; console.warn(`[review] ${clinic.name} → ${phone.slice(-4)}: ${r.error}`); continue; }
     sent++;
-    await db().from("appointments").update({ review_requested_at: new Date().toISOString() }).eq("id", a.id);
-    await db().from("conversations").update({ state: { ...st, reviewAskedAt: new Date().toISOString() } }).eq("id", convId);
+    const now = new Date().toISOString();
+    await db().from("appointments").update({ review_requested_at: now }).eq("id", a.id);
+    await db().from("conversations").update({ state: { ...st, reviewAskedAt: now } }).eq("id", convId);
   }
   return { total: appts?.length ?? 0, sent, skipped, failed };
 }
